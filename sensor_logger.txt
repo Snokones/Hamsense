@@ -41,6 +41,7 @@
 #include <Adafruit_BME280.h>
 #include <Adafruit_MCP9808.h>
 #include <TinyGPSPlus.h>
+#include <LittleFS.h>  // on-flash temperature history (/temps.bin) -- part of the ESP32 core
 #include "secrets.h"   // WIFI_SSID / WIFI_PASSWORD live here -- not in this file, not in git
 
 // Forward declaration for the Arduino IDE's auto-prototype generator: it
@@ -160,6 +161,27 @@ bool     gpsEverFixed = false;
 double   lastLat = 0.0, lastLon = 0.0;
 uint16_t lastGpsYear = 0;
 uint8_t  lastGpsMon = 0, lastGpsDay = 0;
+
+// ---- Intra-day temperature history (LittleFS, 7-day rolling) ----
+// One MCP9808 sample every HISTORY_INTERVAL_MS, stored as {epoch, meanTempF}
+// in a fixed-capacity ring file. To append, we overwrite the slot holding the
+// OLDEST timestamp, so the file always holds the newest HISTORY_CAPACITY
+// samples and needs no separate head pointer on flash to corrupt -- the
+// timestamps are the only bookkeeping. Served as JSON at GET /history.
+struct __attribute__((packed)) TempSample {
+  uint32_t epoch;  // Unix seconds; only ever written with real (synced) time -- see loop() gating
+  float    tF;     // mean outdoor temperature over the interval, deg F
+};
+// epoch 0 is the sentinel for an empty slot (reads back as the "oldest").
+static_assert(sizeof(TempSample) == 8, "TempSample must stay 8 bytes -- /temps.bin layout depends on it");
+
+const char* const   HISTORY_PATH        = "/temps.bin";
+const unsigned long HISTORY_INTERVAL_MS = 900000UL; // 15 min between stored samples
+const int           HISTORY_CAPACITY    = 700;      // ~7 days at 15 min (672) + margin
+bool          littleFsOk    = false;
+double        histSum       = 0.0; // running sum of this interval's readings
+uint32_t      histCount     = 0;   // number of readings folded into histSum
+unsigned long lastHistWrite = 0;   // millis() of the last flush to flash
 
 // ---- Indoor satellite (ESP-NOW) ----
 // Report packet -- MUST exactly match the struct in satellite_sensor.ino.
@@ -308,6 +330,81 @@ void onWsEvent(AsyncWebSocket *server,
 }
 
 // ------------------------------------------------------------
+// Temperature history helpers (LittleFS /temps.bin ring)
+// ------------------------------------------------------------
+
+// Append one sample by overwriting the slot with the oldest timestamp (epoch
+// 0 = empty = oldest). O(HISTORY_CAPACITY) scan, but it runs only once per
+// 15-minute interval, and it means there is no head pointer on flash that
+// could corrupt -- the file self-describes via its timestamps.
+void historyAppend(uint32_t epoch, float tF) {
+  if (!littleFsOk) return;
+  File f = LittleFS.open(HISTORY_PATH, "r+");
+  if (!f) return;
+  uint32_t oldestEpoch = 0xFFFFFFFFUL;
+  int      oldestSlot  = 0;
+  for (int i = 0; i < HISTORY_CAPACITY; i++) {
+    TempSample s;
+    if (f.read((uint8_t*)&s, sizeof(s)) != (int)sizeof(s)) break;
+    if (s.epoch < oldestEpoch) {
+      oldestEpoch = s.epoch;
+      oldestSlot  = i;
+      if (s.epoch == 0) break; // an empty slot is as old as it gets -- take it
+    }
+  }
+  TempSample rec = { epoch, tF };
+  f.seek((uint32_t)oldestSlot * sizeof(TempSample), SeekSet);
+  f.write((const uint8_t*)&rec, sizeof(rec));
+  f.close();
+}
+
+// Serialize the stored samples to JSON: {"unit":"F","interval_s":900,
+// "samples":[[epoch,tempF],...]} sorted ascending, filtered to the last 7
+// days so downtime/clock gaps can't surface stale points. Called from the
+// AsyncTCP task via the /history handler; that task serializes its callbacks,
+// so the static scratch buffer below is not re-entered concurrently.
+String historyToJson() {
+  String out = "{\"unit\":\"F\",\"interval_s\":";
+  out += String(HISTORY_INTERVAL_MS / 1000UL);
+  out += ",\"samples\":[";
+  if (littleFsOk) {
+    uint32_t nowEpoch;
+    bool synced = getEpochSeconds(nowEpoch);
+    uint32_t cutoff = (synced && nowEpoch > 7UL * 86400UL) ? nowEpoch - 7UL * 86400UL : 0;
+
+    // 700 * 8 = 5.6KB kept static (off the small AsyncTCP task stack).
+    static TempSample buf[HISTORY_CAPACITY];
+    int n = 0;
+    File f = LittleFS.open(HISTORY_PATH, "r");
+    if (f) {
+      for (int i = 0; i < HISTORY_CAPACITY; i++) {
+        TempSample s;
+        if (f.read((uint8_t*)&s, sizeof(s)) != (int)sizeof(s)) break;
+        if (s.epoch != 0 && s.epoch >= cutoff) buf[n++] = s;
+      }
+      f.close();
+    }
+    // Insertion sort by epoch -- n is small and the data is near-sorted.
+    for (int i = 1; i < n; i++) {
+      TempSample key = buf[i];
+      int j = i - 1;
+      while (j >= 0 && buf[j].epoch > key.epoch) { buf[j + 1] = buf[j]; j--; }
+      buf[j + 1] = key;
+    }
+    for (int i = 0; i < n; i++) {
+      if (i) out += ',';
+      out += '[';
+      out += String(buf[i].epoch);
+      out += ',';
+      out += String(buf[i].tF, 2);
+      out += ']';
+    }
+  }
+  out += "]}";
+  return out;
+}
+
+// ------------------------------------------------------------
 // Push live sensor data to all WebSocket clients.
 // Includes the sync flag so the UI can warn if the clock hasn't synced yet.
 // ------------------------------------------------------------
@@ -402,6 +499,37 @@ void setup() {
   // check your console; if it reports much more than ~50-1000ms, consider
   // updating your arduino-esp32 core version.
   Serial.printf("I2C bus timeout: %ums\n", Wire.getTimeOut());
+
+  // --- LittleFS: persistent store for the temperature history (/temps.bin) ---
+  // format-on-fail (true) so a blank or corrupt flash comes up usable instead
+  // of leaving history permanently dead. If the history file is absent or the
+  // wrong size (first boot, or HISTORY_CAPACITY changed), (re)create it
+  // preallocated with zeroed records -- epoch 0 reads back as an empty slot.
+  littleFsOk = LittleFS.begin(true);
+  if (littleFsOk) {
+    const size_t wantBytes = (size_t)HISTORY_CAPACITY * sizeof(TempSample);
+    File f = LittleFS.open(HISTORY_PATH, "r");
+    size_t haveBytes = f ? f.size() : 0;
+    if (f) f.close();
+    if (haveBytes != wantBytes) {
+      File w = LittleFS.open(HISTORY_PATH, "w");
+      if (w) {
+        TempSample zero = { 0, 0.0f };
+        for (int i = 0; i < HISTORY_CAPACITY; i++) w.write((const uint8_t*)&zero, sizeof(zero));
+        w.close();
+        Serial.printf("LittleFS: created %s (%u bytes, %d slots).\n",
+                      HISTORY_PATH, (unsigned)wantBytes, HISTORY_CAPACITY);
+      } else {
+        Serial.println("ERROR: LittleFS could not create history file -- history disabled.");
+        littleFsOk = false;
+      }
+    } else {
+      Serial.printf("LittleFS mounted; %s present (%u bytes).\n", HISTORY_PATH, (unsigned)haveBytes);
+    }
+    lastHistWrite = millis(); // baseline so the first stored bucket spans a full interval
+  } else {
+    Serial.println("WARNING: LittleFS mount failed -- temperature history disabled.");
+  }
 
   // BME280 breakouts ship with one of two I2C addresses depending on how
   // the SDO pin is strapped (0x76 if pulled low, which is the common
@@ -518,6 +646,12 @@ void setup() {
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send_P(200, "text/html", index_html);
+  });
+
+  // Temperature history as JSON for the page to plot. Read-only; no more
+  // exposed than the live page at "/" already is on this network.
+  server.on("/history", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(200, "application/json", historyToJson());
   });
 
   // In fallback AP mode, redirect any unrecognized request to "/" -- this is
@@ -668,6 +802,26 @@ void loop() {
       Serial.println("MCP9808 not initialized -- skipping temp read, retrying begin()");
       mcpOk = mcp.begin(0x18);
       if (mcpOk) mcp.setResolution(3); // match the boot path so a recovered sensor runs at full resolution
+    }
+
+    // --- Intra-day temperature history ---
+    // Fold this 10s reading into the current interval's running mean, and
+    // flush that mean to flash every HISTORY_INTERVAL_MS. Gated on a *synced*
+    // clock: an unsynced timestamp (relative millis) would file the sample
+    // under the wrong day, so we simply don't record until GPS/NTP has set
+    // real time. Reuses the existing sensor cadence -- no extra timer.
+    if (littleFsOk && mcpOk) {
+      uint32_t epochNow;
+      if (getEpochSeconds(epochNow)) {
+        histSum   += lastTempF;
+        histCount += 1;
+        if (millis() - lastHistWrite >= HISTORY_INTERVAL_MS && histCount > 0) {
+          historyAppend(epochNow, (float)(histSum / histCount));
+          histSum       = 0.0;
+          histCount     = 0;
+          lastHistWrite = millis();
+        }
+      }
     }
 
     // Humidity + pressure from BME280.
