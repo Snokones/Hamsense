@@ -641,18 +641,31 @@ void setup() {
     Serial.println("Skipping NTP sync -- no internet access in fallback AP mode.");
   }
 
+  // --- Web UI authentication (HTTP Basic Auth) ---
+  // Gate EVERY web path -- the page, the /history JSON, and the WebSocket --
+  // behind a username/password kept in secrets.h (WEB_USER / WEB_PASS). The
+  // browser prompts once and caches the credentials for the origin, so the
+  // same login covers the WS handshake automatically (the WS upgrade is an
+  // HTTP GET to the same host). Gating the socket matters: without it, anyone
+  // could skip the page and pull live readings straight from /ws.
+  // NOTE: this is Basic Auth over plain HTTP -- credentials and data are only
+  // base64-encoded, not encrypted. It keeps casual users off the page but is
+  // sniffable by anyone on the same LAN; real confidentiality would need TLS,
+  // which this async stack can't do practically. Pair with an isolated IoT
+  // VLAN if the LAN isn't fully trusted.
+  ws.setAuthentication(WEB_USER, WEB_PASS);
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send_P(200, "text/html", index_html);
-  });
+  }).setAuthentication(WEB_USER, WEB_PASS);
 
-  // Temperature history as JSON for the page to plot. Read-only; no more
-  // exposed than the live page at "/" already is on this network.
+  // Temperature history as JSON for the page to plot. Behind the same Basic
+  // Auth as "/" -- otherwise the readings would leak around the login.
   server.on("/history", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(200, "application/json", historyToJson());
-  });
+  }).setAuthentication(WEB_USER, WEB_PASS);
 
   // In fallback AP mode, redirect any unrecognized request to "/" -- this is
   // what makes "any URL the phone tries to load" land on the sensor page,
