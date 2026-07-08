@@ -78,6 +78,13 @@ a{color:var(--theme-main);text-decoration:none;margin-top:22px;display:block;tex
 .indoor-row{font-size:16px;line-height:1.55;}
 .indoor-row .lbl{color:var(--theme-dim);font-size:0.75em;margin-right:6px;}
 .indoor-row .iunit{color:var(--theme-dim);font-size:0.75em;margin-left:4px;}
+/* 7-day high/low panel -- mirror of .indoor-panel, pinned bottom-left */
+.history-panel{position:fixed;bottom:14px;left:14px;z-index:1;border:1px solid var(--theme-main);border-radius:8px;background:rgba(0,0,0,0.25);padding:10px 14px;text-align:left;color:var(--theme-main);font-family:Arial;}
+.history-title{font-size:12px;color:var(--theme-dim);letter-spacing:0.08em;margin-bottom:5px;}
+.history-row{font-size:16px;line-height:1.4;white-space:nowrap;}
+.history-row .lbl{color:var(--theme-dim);font-size:0.75em;margin-right:8px;display:inline-block;min-width:2.6em;}
+.history-row .sep{color:var(--theme-dim);margin:0 4px;}
+.history-row .hunit{color:var(--theme-dim);font-size:0.75em;margin-left:4px;}
 </style>
 </head><body>
 
@@ -116,6 +123,13 @@ a{color:var(--theme-main);text-decoration:none;margin-top:22px;display:block;tex
   <div class='indoor-row'><span class='lbl'>HUM</span><span id='inHum'>--</span><span class='iunit'>%</span></div>
   <div class='indoor-row'><span class='lbl'>TEMP</span><span id='inTemp'>--</span><span class='iunit'>F</span></div>
   <div class='indoor-row'><span class='lbl'>PRES</span><span id='inPress'>--</span><span class='iunit'>inHg</span></div>
+</div>
+
+<div class='history-panel'>
+  <div class='history-title'>7-DAY HIGH / LOW</div>
+  <div id='histRows'>
+    <div class='history-row'><span class='lbl'>--</span><span class='hi'>--</span><span class='sep'>/</span><span class='lo'>--</span><span class='hunit'>F</span></div>
+  </div>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
@@ -660,6 +674,73 @@ document.addEventListener('click', (e) => {
 });
 
 applyTheme(loadSavedTheme());
+</script>
+<script>
+// 7-day high/low panel (bottom-left). Pulls the temperature history from
+// /history on the base station, groups samples into local calendar days using
+// the currently selected timezone, and shows each of the last 7 days' high and
+// low. Days with no data show "--". Note: /history stores 15-minute means, so
+// these are the warmest/coolest 15-min average, not true instantaneous extremes.
+(function(){
+  const HIST_REFRESH_MS = 5 * 60 * 1000; // /history only changes every 15 min; 5 min is plenty
+
+  function selectedTz(){
+    const sel = document.getElementById('tzSelect');
+    return (sel && sel.value) || 'America/Los_Angeles';
+  }
+
+  // Stable YYYY-MM-DD key for an epoch (seconds) in the given IANA zone.
+  function dayKey(epochSec, tz){
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit'
+    }).format(new Date(epochSec * 1000));
+  }
+  // Short weekday label for a day key (built at local noon to dodge tz edges).
+  function dayLabel(key, tz){
+    const p = key.split('-').map(Number);
+    const dt = new Date(Date.UTC(p[0], p[1]-1, p[2], 12));
+    return new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday:'short' }).format(dt);
+  }
+
+  function renderHistory(payload){
+    const tz = selectedTz();
+    const byDay = {};
+    const samples = (payload && payload.samples) ? payload.samples : [];
+    samples.forEach(function(s){
+      const k = dayKey(s[0], tz), v = s[1];
+      if (!byDay[k]) byDay[k] = { hi: v, lo: v };
+      else { if (v > byDay[k].hi) byDay[k].hi = v; if (v < byDay[k].lo) byDay[k].lo = v; }
+    });
+
+    // Last 7 local days, oldest first.
+    const nowSec = Math.floor(Date.now() / 1000);
+    let html = '';
+    for (let i = 6; i >= 0; i--){
+      const k = dayKey(nowSec - i * 86400, tz);
+      const rec = byDay[k];
+      const hi = rec ? Math.round(rec.hi) : null;
+      const lo = rec ? Math.round(rec.lo) : null;
+      html += "<div class='history-row'><span class='lbl'>" + dayLabel(k, tz) + "</span>"
+            + "<span class='hi'>"  + (hi == null ? '--' : hi) + "</span>"
+            + "<span class='sep'>/</span>"
+            + "<span class='lo'>"  + (lo == null ? '--' : lo) + "</span>"
+            + "<span class='hunit'>F</span></div>";
+    }
+    document.getElementById('histRows').innerHTML = html;
+  }
+
+  function loadHistory(){
+    fetch('/history').then(function(r){ return r.json(); })
+      .then(renderHistory)
+      .catch(function(){ /* device offline or endpoint absent -- keep last render */ });
+  }
+
+  loadHistory();
+  setInterval(loadHistory, HIST_REFRESH_MS);
+  // Re-render on timezone change so day grouping and labels stay consistent.
+  const sel = document.getElementById('tzSelect');
+  if (sel) sel.addEventListener('change', loadHistory);
+})();
 </script>
 
 </body></html>
