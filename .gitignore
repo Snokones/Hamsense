@@ -1,0 +1,9 @@
+# Secrets — never commit (WiFi creds, MACs)
+secrets.h
+satellite_secrets.h
+
+# Generated / build artifacts
+build/
+*.bin
+*.elf
+*.hex

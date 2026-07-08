@@ -1,0 +1,184 @@
+/*
+  HamSense Satellite -- indoor sensor node
+  XIAO ESP32-C6 + BME280 (I2C)
+
+  Wakes every 60 seconds, reads the BME280 once (forced mode), fires the
+  reading at the base station over ESP-NOW, and goes back to deep sleep.
+  Total awake time per cycle is ~0.3-0.5s, giving an average draw well
+  under 1mA -- months on a small LiPo.
+
+  ESP-NOW needs both ends on the same WiFi channel. The base station's
+  channel is whatever the home router picked, so on first boot (and any
+  time delivery fails) the satellite scans for the home SSID to discover
+  the channel, then caches it in RTC memory, which survives deep sleep --
+  so the ~2s scan cost is paid once, not every wake.
+
+  Wiring (XIAO ESP32-C6): BME280 on I2C (SDA=D4, SCL=D5), 3V3/GND.
+
+  Required libraries: "Adafruit BME280 Library" + "Adafruit Unified Sensor".
+  (ESP-NOW and WiFi are part of the ESP32 core -- nothing extra to install.)
+
+  Setup: copy satellite_secrets.h.example to satellite_secrets.h in this
+  sketch folder and fill in the base station's STA MAC address -- it's
+  printed on the base's Serial Monitor at boot.
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include "satellite_secrets.h" // WIFI_SSID, FALLBACK_AP_SSID, BASE_MAC
+
+// Report packet -- MUST exactly match the struct in the base station's
+// sensor_logger.ino. Packed so both sides agree on the byte layout.
+struct __attribute__((packed)) IndoorReport {
+  float    tempF;
+  float    humidity;
+  float    pressureHPa;  // raw station pressure; base applies SLP correction
+  uint32_t seq;
+};
+// Compile-time guarantee that the packed layout is exactly what the radio
+// protocol expects -- must stay in lockstep with the base station's copy.
+static_assert(sizeof(IndoorReport) == 16, "IndoorReport layout changed -- must match sensor_logger.ino exactly");
+
+// RTC memory survives deep sleep (but not power loss / reset button).
+RTC_DATA_ATTR uint8_t  cachedChannel = 0;  // 0 = unknown, triggers a scan
+RTC_DATA_ATTR uint32_t seqCounter    = 0;
+
+const uint64_t SLEEP_US     = 60ULL * 1000000ULL; // 60 second report interval
+const int      MAX_RETRIES  = 8;   // spans ~320ms -- covers the base's WiFi
+const int      RETRY_GAP_MS = 40;  // power-save sleep windows between beacons
+
+Adafruit_BME280 bme;
+
+volatile bool sendDone = false;
+volatile bool sendOk   = false;
+
+// ESP-NOW send callback -- fires with the MAC-layer ACK result.
+// NOTE: this signature is for recent arduino-esp32 3.x cores. If your core
+// is older (3.0/3.1) and this line fails to compile, swap the signature to:
+//   void onEspNowSent(const uint8_t *mac, esp_now_send_status_t status)
+void onEspNowSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+  sendOk   = (status == ESP_NOW_SEND_SUCCESS);
+  sendDone = true;
+}
+
+void goToSleep() {
+  esp_sleep_enable_timer_wakeup(SLEEP_US);
+  esp_deep_sleep_start(); // never returns
+}
+
+// Scan for the base station's network to learn which channel to use.
+// Tries the home SSID first, then the base's fallback AP name, so the
+// satellite keeps working even when the base is in PotaSense AP mode.
+uint8_t findBaseChannel() {
+  Serial.println("Scanning for base station channel...");
+  int n = WiFi.scanNetworks();
+  uint8_t found = 0;
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) == WIFI_SSID || WiFi.SSID(i) == FALLBACK_AP_SSID) {
+      found = (uint8_t)WiFi.channel(i);
+      Serial.printf("Found \"%s\" on channel %u\n", WiFi.SSID(i).c_str(), found);
+      break;
+    }
+  }
+  WiFi.scanDelete();
+  if (!found) Serial.println("Base network not found in scan.");
+  return found;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setTxTimeoutMs(0); // non-blocking USB CDC, same as the base station
+
+  // --- Read the sensor FIRST (cheap, fast), radio work after ---
+  Wire.begin();
+  bool bmeOk = bme.begin(0x76) || bme.begin(0x77);
+  if (!bmeOk) {
+    Serial.println("BME280 not found -- sleeping, will retry next cycle.");
+    goToSleep();
+  }
+  // Same weather-monitoring config as the base: one conversion on demand.
+  bme.setSampling(Adafruit_BME280::MODE_FORCED,
+                  Adafruit_BME280::SAMPLING_X1,
+                  Adafruit_BME280::SAMPLING_X1,
+                  Adafruit_BME280::SAMPLING_X1,
+                  Adafruit_BME280::FILTER_OFF);
+  bme.takeForcedMeasurement();
+
+  IndoorReport report;
+  report.tempF       = bme.readTemperature() * 9.0f / 5.0f + 32.0f;
+  report.humidity    = bme.readHumidity();
+  report.pressureHPa = bme.readPressure() / 100.0f;
+  report.seq         = ++seqCounter;
+
+  Serial.printf("Indoor: %.1fF  %.1f%%  %.1f hPa  (seq %lu)\n",
+                report.tempF, report.humidity, report.pressureHPa,
+                (unsigned long)report.seq);
+
+  // --- Radio: bring up WiFi in STA mode (no association needed) ---
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(); // we never join the network -- ESP-NOW only
+
+  if (cachedChannel == 0) {
+    cachedChannel = findBaseChannel();
+    if (cachedChannel == 0) {
+      // Can't find the base network at all -- sleep and try again next cycle.
+      goToSleep();
+    }
+  }
+  esp_wifi_set_channel(cachedChannel, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("esp_now_init failed -- sleeping.");
+    goToSleep();
+  }
+  esp_now_register_send_cb(onEspNowSent);
+
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, BASE_MAC, 6);
+  peer.channel = cachedChannel;
+  peer.ifidx   = WIFI_IF_STA;
+  peer.encrypt = false;
+  if (esp_now_add_peer(&peer) != ESP_OK) {
+    Serial.println("add_peer failed -- sleeping.");
+    goToSleep();
+  }
+
+  // --- Send with retries ---
+  // Unicast gives a MAC-layer ACK. The base's WiFi radio power-saves
+  // between router beacons (~100-300ms windows), so a single send can
+  // miss; 8 tries spaced 40ms apart spans the sleep window reliably.
+  bool delivered = false;
+  for (int attempt = 1; attempt <= MAX_RETRIES && !delivered; attempt++) {
+    sendDone = false;
+    sendOk   = false;
+    // If esp_now_send() fails outright (returns an error instead of
+    // queueing), the callback will never fire -- skip the wait and go
+    // straight to the retry instead of burning 100ms of awake time on it.
+    if (esp_now_send(BASE_MAC, (uint8_t *)&report, sizeof(report)) == ESP_OK) {
+      uint32_t t0 = millis();
+      while (!sendDone && millis() - t0 < 100) delay(1);
+      delivered = sendDone && sendOk;
+    }
+    if (!delivered && attempt < MAX_RETRIES) delay(RETRY_GAP_MS);
+  }
+
+  if (delivered) {
+    Serial.println("Delivered.");
+  } else {
+    // Every retry failed -- most likely the router changed channels.
+    // Clear the cache so next wake does a fresh scan.
+    Serial.println("Delivery failed -- will rescan channel next wake.");
+    cachedChannel = 0;
+  }
+
+  goToSleep();
+}
+
+void loop() {
+  // Never reached -- the device deep-sleeps at the end of setup().
+}

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git config *)",
+      "Bash(git init *)",
+      "Bash(printf '%s\\\\n' '# Secrets — never commit \\(WiFi creds, MACs\\)' secrets.h satellite_secrets.h '' '# Generated / build artifacts' build/ *.bin *.elf *.hex)",
+      "Bash(git add *)",
+      "Bash(git commit -q -m 'Baseline: HamSense base station + satellite sketches *)"
+    ]
+  }
+}
