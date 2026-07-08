@@ -1,4 +1,4 @@
-# HamSense
+# Hamsense
 
 A two-node ESP32-C6 weather station. A **base station** reads outdoor temperature, humidity, pressure, and GPS, then serves a live web page over WiFi. A battery-powered **indoor satellite** wakes once a minute, takes a reading, radios it to the base over ESP-NOW, and goes back to deep sleep.
 
