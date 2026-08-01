@@ -42,10 +42,22 @@ body{color:var(--theme-main);font-family:Arial;text-align:center;}
 #mapBg svg{width:100%;height:100%;}
 .content{position:fixed;left:0;right:0;bottom:0;z-index:1;padding-bottom:28px;}
 .wrap{display:flex;justify-content:center;gap:28px;align-items:flex-end;}
-.reading{display:flex;align-items:flex-end;gap:3px;border:1px solid var(--theme-main);border-radius:8px;padding:8px 14px;background:rgba(0,0,0,0.25);}
+.reading{display:flex;align-items:flex-end;gap:3px;border:1px solid var(--theme-main);border-radius:8px;padding:8px 14px;background:rgba(0,0,0,0.25);box-shadow:0 0 10px var(--theme-glow),inset 0 0 12px rgba(0,0,0,0.6);}
 .digit{position:relative;width:28px;height:47px;display:inline-block;margin:0 2px;}
-.seg{position:absolute;background:transparent;border-radius:2px;transition:0.2s;}
-.on{background:var(--theme-main);box-shadow:0 0 4px var(--theme-main),0 0 7px var(--theme-glow);}
+/* Transition the two properties that actually change, NOT `all`. With
+   `transition:all`, a change to --theme-main does not invalidate already-
+   painted segments in Chromium: the custom property updates, var() resolves
+   to the new colour, and the element keeps rendering the old one until it is
+   recreated. That made theme switching appear to do nothing until the next
+   WebSocket push rebuilt the digits. applyTheme() also forces a re-render as
+   a belt-and-braces fix -- see the theme picker script. */
+.seg{position:absolute;background:transparent;border-radius:2px;transition:background-color 0.2s,box-shadow 0.2s;}
+/* Lit segment bloom. Three layers instead of two: a tight core at the segment
+   edge, a mid halo, and a wide soft spill. The wide layer is what actually
+   reads as "glowing" on black -- the old 4px/7px pair was too tight to spread
+   past the segment itself, so low-luminance themes (blue, red, pink) looked
+   flat no matter what color they were. */
+.on{background:var(--theme-main);box-shadow:0 0 5px var(--theme-main),0 0 13px var(--theme-glow),0 0 26px var(--theme-glow);}
 .A{top:0;left:5px;width:18px;height:5px;}
 .B{top:5px;right:0;width:5px;height:18px;}
 .C{bottom:5px;right:0;width:5px;height:18px;}
@@ -56,8 +68,8 @@ body{color:var(--theme-main);font-family:Arial;text-align:center;}
 .unit{font-size:20px;color:var(--theme-main);opacity:0.9;align-self:center;text-shadow:0 0 4px rgba(0,0,0,0.8);}
 .unit-small{font-size:16px;}
 .dot-container{width:10px;display:inline-block;height:47px;vertical-align:bottom;}
-.dot{width:5px;height:5px;border-radius:50%;background:transparent;margin:0 auto;position:relative;top:37px;transition:0.2s;}
-.dot.on{background:var(--theme-main);box-shadow:0 0 4px var(--theme-main),0 0 7px var(--theme-glow);}
+.dot{width:5px;height:5px;border-radius:50%;background:transparent;margin:0 auto;position:relative;top:37px;transition:background-color 0.2s,box-shadow 0.2s;}
+.dot.on{background:var(--theme-main);box-shadow:0 0 5px var(--theme-main),0 0 13px var(--theme-glow),0 0 26px var(--theme-glow);}
 a{color:var(--theme-main);text-decoration:none;margin-top:22px;display:block;text-shadow:0 0 4px rgba(0,0,0,0.8);}
 .status{font-size:11px;color:#999;margin-top:14px;text-shadow:0 0 4px rgba(0,0,0,0.8);display:none;}
 .status.synced{color:#5c5;}
@@ -125,12 +137,13 @@ a{color:var(--theme-main);text-decoration:none;margin-top:22px;display:block;tex
 
 <button class='theme-btn' id='themeBtn' aria-label='Change theme color'><span class='swatch'></span></button>
 <div class='theme-menu' id='themeMenu'>
-  <button data-theme='amber' style='background:#ff8c00' aria-label='Amber'></button>
-  <button data-theme='red' style='background:#ff3b30' aria-label='Red'></button>
-  <button data-theme='green' style='background:#34c759' aria-label='Green'></button>
+  <!-- Swatch colors must track THEMES.<name>.main in the theme script below. -->
+  <button data-theme='amber' style='background:#ffb04d' aria-label='Amber'></button>
+  <button data-theme='red' style='background:#ff5347' aria-label='Red'></button>
+  <button data-theme='green' style='background:#4ade80' aria-label='Green'></button>
   <button data-theme='yellow' style='background:#ffd60a' aria-label='Yellow'></button>
-  <button data-theme='blue' style='background:#0a84ff' aria-label='Blue'></button>
-  <button data-theme='pink' style='background:#ff2d78' aria-label='Pink'></button>
+  <button data-theme='blue' style='background:#58b6ff' aria-label='Blue'></button>
+  <button data-theme='pink' style='background:#ff5fa2' aria-label='Pink'></button>
 </div>
 
 <div class='indoor-panel'>
@@ -230,8 +243,11 @@ function terminatorLatLon(declDeg, subsolarLon) {
   const landFill = 'rgba(245,242,235,0.45)';
   const oceanFill = '#000000';
   const nightFill = 'rgba(0,0,0,0.55)';
-  let strokeColor = 'rgba(255,140,0,0.15)';
-  let terminatorColor = 'rgba(255,140,0,0.4)';
+  // Initial values only -- setMapThemeColor() overwrites both as soon as the
+  // saved theme is applied. Alphas raised (0.15 -> 0.30, 0.40 -> 0.65) so the
+  // theme color actually registers on the map instead of being a hint.
+  let strokeColor = 'rgba(255,176,77,0.30)';
+  let terminatorColor = 'rgba(255,176,77,0.65)';
 
   const scale = Math.max(W, H) / (2 * Math.PI) * 1.05 * 0.9; // 10% smaller
   const projection = d3.geoMercator()
@@ -300,8 +316,8 @@ function terminatorLatLon(declDeg, subsolarLon) {
     const r = parseInt(hexColor.slice(1, 3), 16);
     const g = parseInt(hexColor.slice(3, 5), 16);
     const b = parseInt(hexColor.slice(5, 7), 16);
-    strokeColor = `rgba(${r},${g},${b},0.15)`;
-    terminatorColor = `rgba(${r},${g},${b},0.4)`;
+    strokeColor = `rgba(${r},${g},${b},0.30)`;
+    terminatorColor = `rgba(${r},${g},${b},0.65)`;
     landLayer.selectAll('path').attr('stroke', strokeColor);
     nightLayer.selectAll('path.terminator-line').attr('stroke', terminatorColor);
     // Repaint the location pin with the new theme color if one is showing
@@ -657,13 +673,27 @@ setInterval(tickClock, 5000); // 5s is plenty now that only h:m is shown
 // Theme color picker. Each entry: main (lit segments/text), glow (outer
 // box-shadow, a deeper shade of main), dim (muted variant for the small
 // UTC/timezone-dim labels). Persisted in localStorage so it survives reloads.
+// Theme colors. Three roles per theme:
+//   main - lit segments and primary text
+//   glow - the bloom halo behind lit elements. NOTE this is now a *brighter,
+//          more saturated* companion to main, not a darker shade. The old
+//          darker glow muddied the halo instead of spreading it.
+//   dim  - small labels (UTC/GRID/unit captions, panel titles)
+//
+// Everything here is tuned for a pure black background, where perceived
+// brightness tracks relative luminance. Yellow was the reference point: at
+// ~0.69 it was roughly 3x the old blue (~0.24), which is exactly why it was
+// the only one that read as "popping". The others were raised toward it as
+// far as their hue allows -- red and pink physically cannot reach yellow's
+// luminance without turning into salmon and bubblegum, so they lean on the
+// wider bloom below instead. Yellow's `main` is deliberately unchanged.
 const THEMES = {
-  amber:  { main: '#ff8c00', glow: '#cc7000', dim: '#c98a2e' },
-  red:    { main: '#ff3b30', glow: '#b8241c', dim: '#c9504a' },
-  green:  { main: '#34c759', glow: '#1f9f42', dim: '#3fae5e' },
-  yellow: { main: '#ffd60a', glow: '#cc9f00', dim: '#cbaa2e' },
-  blue:   { main: '#0a84ff', glow: '#0860c4', dim: '#3f8fd9' },
-  pink:   { main: '#ff2d78', glow: '#c41f5c', dim: '#cf4d7e' }
+  amber:  { main: '#ffb04d', glow: '#ff8c00', dim: '#e8a962' },
+  red:    { main: '#ff5347', glow: '#ff2a1c', dim: '#f08279' },
+  green:  { main: '#4ade80', glow: '#22c55e', dim: '#7eeaa8' },
+  yellow: { main: '#ffd60a', glow: '#ffc400', dim: '#edcb52' },
+  blue:   { main: '#58b6ff', glow: '#0a84ff', dim: '#8ecdff' },
+  pink:   { main: '#ff5fa2', glow: '#ff1e73', dim: '#ff96c2' }
 };
 
 function applyTheme(name) {
@@ -676,6 +706,13 @@ function applyTheme(name) {
   // need to be updated directly here too -- otherwise they'd stay amber
   // regardless of the chosen theme.
   if (window.setMapThemeColor) window.setMapThemeColor(t.main);
+  // Repaint the seven-segment digits. Already-painted .seg elements do not
+  // reliably pick up a --theme-main change on their own (see the .seg
+  // transition comment in the stylesheet), so without this the readouts keep
+  // the previous theme's colour until the next WebSocket push rebuilds them
+  // -- up to 30s of the picker apparently doing nothing. Guarded because
+  // applyTheme() also runs at load, before any reading has arrived.
+  if (typeof _lastWs !== 'undefined' && _lastWs) renderReadings(_lastWs);
 }
 
 function loadSavedTheme() {
