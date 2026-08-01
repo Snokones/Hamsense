@@ -1,29 +1,56 @@
 /*
-  ESP32-C6 multi-sensor station - temperature (MCP9808), humidity + pressure
-  (BME280), and GPS (ATGM336H)
-  - AsyncWebServer + WebSocket, single live page
-  - GPS UTC time as primary clock source (NTP as fallback when GPS has no fix)
-  - Temperature from MCP9808 (high-precision I2C, ±0.25°C typical accuracy)
-  - Humidity + pressure from BME280 (I2C)
-  - GPS position from ATGM336H (UART1, D6=TX, D7=RX, 9600 baud, TinyGPS++)
+  ESP32-C6 multi-sensor station - temperature (MCP9808) + humidity/pressure
+  (BME280).  NO-GPS VARIANT.
+
+  This is the no-GPS build of the base station. The ATGM336H and TinyGPS++
+  are gone entirely; everything the GPS used to supply now comes from a ZIP
+  code the user enters on the web page:
+
+    GPS gave us          ->  now comes from
+    -------------------      ------------------------------------------
+    UTC time (primary)   ->  NTP only (see the AP-mode caveat below)
+    latitude/longitude   ->  AccuWeather location lookup for the ZIP
+    altitude             ->  same lookup (GeoPosition.Elevation), applied
+                             browser-side, so the firmware no longer does
+                             any sea-level-pressure correction at all
+    date                 ->  the browser's own clock
+
+  Consequences worth knowing:
+  - Pressure sent over the WebSocket is now RAW STATION PRESSURE, both for
+    the outdoor BME280 ("p") and the indoor satellite ("in"."p"). The page
+    applies the ICAO sea-level correction using the ZIP's elevation. Do not
+    re-add the correction here without also removing it from web_pages.h,
+    or it will be applied twice.
+  - NTP is the ONLY clock source now. In "PotaSense" AP-fallback mode there
+    is no internet, so the clock never syncs -- and because history writes
+    are gated on a synced clock, no history is recorded while in AP mode.
+    GPS used to cover that case. A DS3231 RTC is the cheap fix if it ever
+    matters; re-adding GPS is not.
+
+  Other features (unchanged from the GPS build):
+  - AsyncWebServer + WebSocket, single live page, HTTP Basic Auth
   - ESP-NOW receiver for the indoor satellite node (satellite_sensor.ino,
     a XIAO ESP32-C6 + BME280 that deep-sleeps and reports every minute);
     the IndoorReport struct here must match the satellite's exactly
-  - 10s sampling, pushed live to connected clients over WebSocket
-  - Seven-segment display: temp (MCP9808), humidity + pressure (BME280),
-    day/night Mercator map background, WS auto-reconnect
+  - 30s sampling, pushed live to connected clients over WebSocket
+  - 7-day temperature history on flash (LittleFS), served at GET /history
+  - Seven-segment display, day/night Mercator map, WS auto-reconnect
   - WiFi: tries the home network (3 attempts), falls back to broadcasting
     its own AP ("PotaSense") with a DNS redirect if it can't connect
+
+  Power: this board serves an always-on web page, so it never sleeps. The
+  savings here come from deleting the GPS (~25-30mA) and running the CPU at
+  80MHz. Deep/light sleep is deliberately NOT used -- it would kill both the
+  web server and the USB CDC port used for firmware updates.
 
   Wiring (XIAO ESP32-C6):
     MCP9808:   I2C (SDA=D4, SCL=D5), 3V3/GND, default address 0x18
     BME280:    I2C (SDA=D4, SCL=D5), 3V3/GND, address 0x76 or 0x77
-    ATGM336H:  GPS TX -> D7 (ESP32 RX), GPS RX -> D6 (ESP32 TX), 3V3/GND
+    (UART1 / D6 / D7 are now free -- nothing is connected to them.)
 
   Required libraries (Arduino Library Manager):
     "Adafruit BME280 Library" + dependency "Adafruit Unified Sensor"
     "Adafruit MCP9808 Library"
-    "TinyGPSPlus" by Mikal Hart
 */
 
 
@@ -40,9 +67,16 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <Adafruit_MCP9808.h>
-#include <TinyGPSPlus.h>
 #include <LittleFS.h>  // on-flash temperature history (/temps.bin) -- part of the ESP32 core
 #include "secrets.h"   // WIFI_SSID / WIFI_PASSWORD live here -- not in this file, not in git
+
+// Fail the build loudly rather than shipping an empty key and debugging a
+// silently broken forecast panel later. Same philosophy as WEB_USER/WEB_PASS:
+// if it's required, its absence should be a compile error, not a runtime
+// surprise. Get a free key at https://developer.accuweather.com/.
+#ifndef ACCUWEATHER_API_KEY
+#error "ACCUWEATHER_API_KEY missing from secrets.h -- copy secrets.h.example and fill it in."
+#endif
 
 // Forward declaration for the Arduino IDE's auto-prototype generator: it
 // inserts function prototypes near the top of the file, BEFORE our type
@@ -82,42 +116,6 @@ void configureBme() {
 Adafruit_MCP9808 mcp;
 bool mcpOk = false;
 
-// GPS (ATGM336H on UART1: D6=TX GPIO16, D7=RX GPIO17, 9600 baud)
-TinyGPSPlus gps;
-HardwareSerial gpsSerial(1); // UART1
-
-// GPS power management -- sleep/wake cycle to reduce average current draw.
-// The ATGM336H draws ~25-30mA continuously; duty-cycling it to 30s active
-// every 10 minutes drops its average contribution to ~1-2mA.
-// Sleep command: $PMTK161,0*28 (confirmed checksum, standard MTK protocol)
-// Wake: any byte sent over UART after >=120ms of sleep
-enum GpsState { GPS_AWAKE, GPS_SLEEPING };
-GpsState gpsState        = GPS_AWAKE;
-unsigned long gpsStateMs = 0;          // millis() when we entered the current state
-bool gpsFixThisWindow    = false;      // fresh fix seen since the current wake?
-const unsigned long GPS_AWAKE_MS     = 30000;  // minimum awake time per cycle
-const unsigned long GPS_AWAKE_MAX_MS = 90000;  // hard cap if no fix arrives --
-                                               // a dead antenna can't pin the GPS on forever
-const unsigned long GPS_SLEEP_MS     = 600000; // 10 minutes asleep
-
-void gpsSetSleep() {
-  gpsSerial.print("$PMTK161,0*28\r\n");
-  gpsSerial.flush(); // ensure bytes transmit before we stop checking
-  gpsState  = GPS_SLEEPING;
-  gpsStateMs = millis();
-  Serial.println("GPS sleeping (10 min).");
-}
-
-void gpsWake() {
-  // Any byte wakes the module; must wait >=120ms after sleep before sending.
-  // We've been sleeping for 10 minutes so the 120ms constraint is long past.
-  gpsSerial.print("\r\n");
-  gpsState  = GPS_AWAKE;
-  gpsStateMs = millis();
-  gpsFixThisWindow = false;
-  Serial.println("GPS waking for fix...");
-}
-
 // ---- Async server + WebSocket ----
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
@@ -125,8 +123,12 @@ DNSServer dnsServer;
 bool runningAsAP = false;
 
 // ---- Timers ----
+// 30s rather than the GPS build's 10s: fewer WebSocket pushes means less
+// radio airtime, and a seven-segment weather display gains nothing from
+// 10-second granularity. This is also the cadence the history mean is
+// accumulated at (see loop()).
 unsigned long lastSensorRead = 0;
-const unsigned long SENSOR_INTERVAL_MS = 10000;   // 10 seconds
+const unsigned long SENSOR_INTERVAL_MS = 30000;   // 30 seconds
 
 // ---- WiFi watchdog ----
 // The connection is only established once in setup(); without this, a
@@ -146,21 +148,13 @@ unsigned long wifiDownSince = 0; // 0 = link currently up
 const float TEMP_OFFSET_F = 0.0f;
 
 // ---- Live data ----
+// lastPressureHPa is RAW STATION PRESSURE. There is deliberately no altitude
+// variable here any more: the sea-level correction needs an elevation, that
+// elevation now comes from the ZIP code lookup in the browser, so the
+// correction is applied browser-side in web_pages.h. See the file header.
 float lastHumidity    = 0.0;
 float lastTempF       = 0.0;
 float lastPressureHPa = 0.0;
-float lastAltitudeM   = 0.0; // last known GPS altitude in metres; 0 = sea level fallback before first fix
-
-// Latched GPS position/date -- captured while the GPS is awake with a fresh
-// fix, then reused while it sleeps. For a stationary station the position
-// doesn't change between wake cycles, so the page keeps showing valid data
-// (pin, grid square, sunrise/sunset, date) instead of blanking to "--" for
-// the 10 minutes the GPS radio is off. The date can be up to one sleep
-// cycle stale across UTC midnight; the next wake refreshes it.
-bool     gpsEverFixed = false;
-double   lastLat = 0.0, lastLon = 0.0;
-uint16_t lastGpsYear = 0;
-uint8_t  lastGpsMon = 0, lastGpsDay = 0;
 
 // ---- Intra-day temperature history (LittleFS, 7-day rolling) ----
 // One MCP9808 sample every HISTORY_INTERVAL_MS, stored as {epoch, meanTempF}
@@ -191,7 +185,7 @@ unsigned long lastHistWrite = 0;   // millis() of the last flush to flash
 struct __attribute__((packed)) IndoorReport {
   float    tempF;
   float    humidity;
-  float    pressureHPa;  // raw station pressure; SLP correction applied here
+  float    pressureHPa;  // raw station pressure; forwarded raw, corrected in the browser
   uint32_t seq;
 };
 // Compile-time guarantee that the packed layout is exactly what the radio
@@ -245,9 +239,10 @@ const char *NTP_SERVER_2 = "time.nist.gov";
 // Pacific Northwest: America/Los_Angeles. POSIX TZ string handles PST/PDT DST automatically.
 const char *TZ_STRING = "PST8PDT,M3.2.0,M11.1.0";
 
-// Returns true and fills `outEpoch` with a valid Unix time if NTP or GPS
-// has synced the clock. Falls back to millis()-since-boot and returns false
-// so callers can flag data as unsynced.
+// Returns true and fills `outEpoch` with a valid Unix time if NTP has synced
+// the clock. Falls back to millis()-since-boot and returns false so callers
+// can flag data as unsynced. NTP is the only time source in this build, so
+// this returns false for the whole session in AP-fallback mode.
 bool getEpochSeconds(uint32_t &outEpoch) {
   time_t now;
   time(&now);
@@ -260,53 +255,12 @@ bool getEpochSeconds(uint32_t &outEpoch) {
   return false;
 }
 
-// Apply a validated GPS time to the ESP32 system clock.
-// Called from loop() whenever TinyGPS++ reports a fresh, valid date+time.
-// GPS time is always UTC. The existing TZ string on the system clock handles
-// local-time offset automatically, same as NTP.
-bool applyGpsTime(TinyGPSDate &d, TinyGPSTime &t) {
-  if (!d.isValid() || !t.isValid()) return false;
-
-  // Convert GPS date+time (UTC) to a Unix epoch (seconds since 1970-01-01 UTC).
-  // We can't rely on timegm() being available in all arduino-esp32 newlib
-  // versions (it's a POSIX extension that some builds omit), so compute the
-  // epoch directly using the standard day-counting formula instead.
-  int y = d.year();
-  int m = d.month();
-  int day_val = d.day();
-
-  // Shift months so March=1, making leap-day fall at end of year (simplifies math)
-  if (m <= 2) { y--; m += 12; }
-  long days = 365L*y + y/4 - y/100 + y/400   // days from year 0 to year y
-            + (153*m + 8) / 5                  // days from March 1 to month m
-            + day_val
-            - 719562;                           // offset to 1970-01-01 epoch (verified)
-
-  time_t epoch = (time_t)(days * 86400L
-                          + t.hour()   * 3600L
-                          + t.minute() * 60L
-                          + t.second());
-
-  if (epoch < 1704067200L) return false; // sanity: reject anything before 2024-01-01
-
-  struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
-  int result = settimeofday(&tv, nullptr);
-  if (result == 0) {
-    Serial.printf("GPS time set: %04d-%02d-%02d %02d:%02d:%02d UTC (epoch %ld)\n",
-                  d.year(), d.month(), d.day(),
-                  t.hour(), t.minute(), t.second(), (long)epoch);
-  }
-  return (result == 0);
-}
-
-// How often to re-apply GPS time to the system clock (seconds).
-// Once per minute is more than precise enough for this application and
-// avoids any risk of flooding settimeofday() calls if the GPS is continuously
-// outputting valid fixes. Only sets time when GPS reports a fresh fix
-// (age < 1500ms per TinyGPS++ convention).
-const unsigned long GPS_SYNC_INTERVAL_MS = 60000;
-unsigned long lastGpsSync = 0;
-
+// NOTE: the GPS build carried an applyGpsTime() here that converted a
+// TinyGPS++ date/time into a Unix epoch by hand (timegm() isn't reliably
+// available in arduino-esp32's newlib) and pushed it via settimeofday().
+// With the GPS gone there is nothing to feed it, so it was removed along
+// with its sync-interval throttle. configTzTime() in setup() is now the
+// only thing that ever sets the clock.
 
 // The HTML page (index_html) lives in web_pages.h -- see that file
 // for why it was moved out of this .ino (Arduino IDE ctags bug).
@@ -412,10 +366,13 @@ void pushSensorData() {
   uint32_t epoch;
   bool synced = getEpochSeconds(epoch);
 
-  StaticJsonDocument<448> doc; // bumped from 320 for the indoor object
+  // 256 is comfortable for 5 top-level members + the 4-member "in" object.
+  // (Was 448 in the GPS build, which also had to carry a 6-member "gps"
+  // object; that object is gone, so this shrank with it.)
+  StaticJsonDocument<256> doc;
   doc["h"]    = lastHumidity;
   doc["t"]    = lastTempF;
-  doc["p"]    = lastPressureHPa;
+  doc["p"]    = lastPressureHPa; // RAW station pressure -- page applies SLP correction
   doc["ts"]   = epoch;
   doc["sync"] = synced ? 1 : 0;
 
@@ -431,34 +388,14 @@ void pushSensorData() {
   JsonObject inObj = doc.createNestedObject("in");
   inObj["ok"] = indoorOk ? 1 : 0;
   if (indoorOk) {
-    // Sea-level correction for the indoor barometer. The correction models
-    // the OUTDOOR air column between our altitude and sea level, so it uses
-    // the outdoor (MCP9808) temperature -- the indoor thermostat setting
-    // says nothing about the atmosphere outside. Falls back to the indoor
-    // temperature only if the outdoor sensor is down. Both sensors share
-    // the base's GPS altitude (same site).
-    float colTempC = mcpOk ? (lastTempF - 32.0f) * 5.0f / 9.0f
-                           : (indoorCopy.tempF - 32.0f) * 5.0f / 9.0f;
-    float inSlp = indoorCopy.pressureHPa *
-                  powf(1.0f + (0.0065f * lastAltitudeM) / (colTempC + 273.15f), 5.2561f);
+    // Forwarded raw, exactly as the satellite measured it. The sea-level
+    // correction that used to happen here needed an altitude, which the GPS
+    // supplied; it now happens in the browser using the ZIP's elevation.
+    // The page uses the OUTDOOR temperature for that correction (the air
+    // column being modelled is outside), which it already has.
     inObj["t"] = indoorCopy.tempF;
     inObj["h"] = indoorCopy.humidity;
-    inObj["p"] = inSlp;
-  }
-
-  // GPS: report the latched position/date once any fix has ever been
-  // acquired. The values are refreshed each wake cycle; between cycles
-  // (GPS sleeping) they're stale by at most GPS_SLEEP_MS, which is fine
-  // for a stationary station -- far better than blanking the page's GPS
-  // data to "--" for 9.5 of every 10 minutes.
-  JsonObject gpsObj = doc.createNestedObject("gps");
-  gpsObj["fix"] = gpsEverFixed ? 1 : 0;
-  if (gpsEverFixed) {
-    gpsObj["lat"]  = lastLat;
-    gpsObj["lon"]  = lastLon;
-    gpsObj["year"] = lastGpsYear;
-    gpsObj["mon"]  = lastGpsMon;
-    gpsObj["day"]  = lastGpsDay;
+    inObj["p"] = indoorCopy.pressureHPa;
   }
 
   String json;
@@ -471,9 +408,22 @@ void pushSensorData() {
 // ------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  Serial.setTxTimeoutMs(0); // prevent USB CDC blocking from starving UART1 (GPS)
-                             // confirmed fix for ESP32-C6 USB CDC vs HardwareSerial conflict
-  delay(300);
+  // Non-blocking USB CDC writes. In the GPS build this existed to stop CDC
+  // backpressure from starving UART1; there's no UART1 any more, but keep it:
+  // without it, Serial.printf() blocks for seconds when the USB port is
+  // enumerated but nothing is reading it, which stalls loop() and the
+  // WebSocket pushes with it.
+  Serial.setTxTimeoutMs(0);
+  delay(300); // keep this -- it's the window that makes a bad build interruptible
+
+  // --- CPU frequency: power ---
+  // 80MHz is the floor with WiFi active (the radio will not run below it) and
+  // saves roughly 15-25mA versus the 160MHz default. Safe for USB Serial/JTAG
+  // on the C6, so firmware updates over USB are unaffected. Do NOT go lower
+  // while WiFi is up, and do NOT reach for deep/light sleep on this node --
+  // it serves an always-on page and must keep the USB port enumerated.
+  setCpuFrequencyMhz(80);
+  Serial.printf("CPU frequency: %uMHz\n", getCpuFrequencyMhz());
 
   // --- Turn off the onboard yellow LED ---
   // XIAO ESP32-C6's built-in LED is on GPIO15 and is ACTIVE-LOW (the pin
@@ -556,18 +506,8 @@ void setup() {
     Serial.println("WARNING: MCP9808 not found at 0x18 -- check wiring. Will keep retrying in loop().");
   }
 
-  // ATGM336H GPS on UART1: D6 (GPIO16) = ESP32 TX -> GPS RX,
-  //                         D7 (GPIO17) = ESP32 RX <- GPS TX
-  // Default baud rate for this module is 9600 -- confirmed from datasheet
-  // and multiple independent sources. RX pin is listed first in begin().
-  gpsSerial.setRxBufferSize(512);             // must be called before begin(); default 256 can overflow during WiFi bursts
-  gpsSerial.begin(9600, SERIAL_8N1, D7, D6); // (baud, config, RX_pin, TX_pin)
-  gpsStateMs = millis();                      // start the first awake window from boot
-  Serial.println("GPS serial started (UART1, 9600 baud). First awake window: 30s.");
-  // Note: GPS takes time to acquire its first fix (typically 30-90 seconds
-  // outdoors with clear sky view; much longer indoors). The device will
-  // operate normally from the start -- GPS time sync simply won't happen
-  // until a fix is acquired, at which point it sets the clock automatically.
+  // (No GPS UART in this build. D6/D7 and UART1 are unused and left
+  // uninitialised -- nothing should be wired to them.)
 
   // --- WiFi: try the home network, fall back to our own AP if it's not available ---
   // 3 attempts (~15s each, ~45s worst case) before giving up on STA and
@@ -667,6 +607,30 @@ void setup() {
     request->send(200, "application/json", historyToJson());
   }).setAuthentication(WEB_USER, WEB_PASS);
 
+  // --- /config: hands the AccuWeather API key to the page ---
+  // The forecast is fetched by the BROWSER, so the key has to reach the
+  // JavaScript somehow. Serving it from here keeps it in secrets.h (which is
+  // gitignored) instead of hardcoding it into web_pages.h (which is
+  // committed) -- that is the whole point of this endpoint.
+  //
+  // Be clear about what this does and does not buy you: the key stays out of
+  // git, but anyone who can log into the page can read it, either from this
+  // response or from the browser's network tab. That is inherent to
+  // browser-side fetching of a keyed API, not a flaw in this handler. The
+  // key is rate-limited (50 calls/day free tier) and grants nothing except
+  // weather lookups, so the exposure is bounded -- but rotate it if the page
+  // password ever leaks.
+  //
+  // Auth is per-handler on this server, not global. Forgetting the
+  // .setAuthentication() below would publish the key to anyone on the LAN.
+  // AccuWeather keys are alphanumeric, so no JSON escaping is needed.
+  server.on("/config", HTTP_GET, [](AsyncWebServerRequest *request){
+    String cfg = "{\"awkey\":\"";
+    cfg += ACCUWEATHER_API_KEY;
+    cfg += "\"}";
+    request->send(200, "application/json", cfg);
+  }).setAuthentication(WEB_USER, WEB_PASS);
+
   // In fallback AP mode, redirect any unrecognized request to "/" -- this is
   // what makes "any URL the phone tries to load" land on the sensor page,
   // combined with the DNSServer answering every hostname with our own IP.
@@ -748,63 +712,6 @@ void loop() {
     }
   }
 
-  // GPS sleep/wake state machine.
-  // When awake: feed bytes to TinyGPS++ and apply time sync as before.
-  // When sleeping: drain the UART buffer (discarding bytes) so it doesn't
-  // back up, and flip to awake after 10 minutes.
-  if (gpsState == GPS_AWAKE) {
-    while (gpsSerial.available() > 0) {
-      gps.encode(gpsSerial.read());
-    }
-    // Apply GPS time sync while awake and fix is fresh
-    if (gps.date.isValid() && gps.time.isValid() &&
-        gps.date.age() < 1500 && gps.time.age() < 1500 &&
-        now - lastGpsSync >= GPS_SYNC_INTERVAL_MS) {
-      if (applyGpsTime(gps.date, gps.time)) {
-        lastGpsSync = now;
-      }
-    }
-    // Latch position, altitude, and date whenever we have a fresh fix --
-    // these persist across sleep cycles so the page keeps valid data while
-    // the GPS radio is off.
-    if (gps.location.isValid() && gps.location.age() < 5000) {
-      lastLat = gps.location.lat();
-      lastLon = gps.location.lng();
-      // Altitude is the noisiest GPS output -- poor satellite geometry can
-      // put it off by tens of metres, which skews the pressure correction.
-      // Only update the stored altitude when fix quality is good (HDOP < 2),
-      // otherwise keep the previous good value (latch, don't zero). The
-      // isValid() guard matters: hdop() reads 0.0 before the first
-      // HDOP-bearing sentence arrives, which would sneak past the < 2 check.
-      if (gps.altitude.isValid() && gps.hdop.isValid() && gps.hdop.hdop() < 2.0) {
-        lastAltitudeM = (float)gps.altitude.meters();
-      }
-      if (gps.date.isValid()) {
-        lastGpsYear = gps.date.year();
-        lastGpsMon  = gps.date.month();
-        lastGpsDay  = gps.date.day();
-      }
-      gpsEverFixed     = true;
-      gpsFixThisWindow = true;
-    }
-    // Adaptive sleep decision: sleep once we've been awake the minimum
-    // 30s AND actually seen a fresh fix this window -- or at the 90s hard
-    // cap regardless, so poor reception extends the window (hot-start
-    // reacquisition occasionally exceeds 30s) but a dead antenna can't
-    // keep the GPS powered forever.
-    unsigned long awakeFor = now - gpsStateMs;
-    if ((awakeFor >= GPS_AWAKE_MS && gpsFixThisWindow) ||
-        awakeFor >= GPS_AWAKE_MAX_MS) {
-      gpsSetSleep();
-    }
-  } else { // GPS_SLEEPING
-    // Drain any stray bytes without parsing them
-    while (gpsSerial.available() > 0) gpsSerial.read();
-    // Wake up after GPS_SLEEP_MS
-    if (now - gpsStateMs >= GPS_SLEEP_MS) {
-      gpsWake();
-    }
-  }
   if (now - lastSensorRead >= SENSOR_INTERVAL_MS) {
     lastSensorRead = now;
 
@@ -818,11 +725,14 @@ void loop() {
     }
 
     // --- Intra-day temperature history ---
-    // Fold this 10s reading into the current interval's running mean, and
+    // Fold this 30s reading into the current interval's running mean, and
     // flush that mean to flash every HISTORY_INTERVAL_MS. Gated on a *synced*
     // clock: an unsynced timestamp (relative millis) would file the sample
-    // under the wrong day, so we simply don't record until GPS/NTP has set
-    // real time. Reuses the existing sensor cadence -- no extra timer.
+    // under the wrong day, so we simply don't record until NTP has set real
+    // time. Reuses the existing sensor cadence -- no extra timer.
+    // NOTE: NTP is the only clock source in this build, so in AP-fallback
+    // mode this gate never opens and no history is recorded. That is a known
+    // and accepted consequence of dropping the GPS.
     if (littleFsOk && mcpOk) {
       uint32_t epochNow;
       if (getEpochSeconds(epochNow)) {
@@ -841,27 +751,19 @@ void loop() {
     if (bmeOk) {
       // Forced mode: the sensor idles until we explicitly trigger one
       // conversion. Blocks ~10ms at 1x oversampling -- negligible at a
-      // 10-second read interval.
+      // 30-second read interval.
       bme.takeForcedMeasurement();
-      lastHumidity     = bme.readHumidity();
-      // Station pressure in hPa, then reduce to sea-level pressure using the
-      // ICAO standard barometric formula:
+      lastHumidity    = bme.readHumidity();
+      // RAW station pressure -- no sea-level reduction here. The ICAO
+      // correction needs a station altitude, which used to come from the GPS
+      // and now comes from the ZIP code's elevation, which only the browser
+      // knows. web_pages.h applies:
       //   SLP = P_station * (1 + (0.0065 * alt_m) / T_K) ^ 5.2561
-      // Uses GPS altitude (metres) and MCP9808 temperature (°C) for accuracy.
-      // lastAltitudeM is 0 before the first GPS fix, giving no correction
-      // (safe fallback -- better than applying a wrong correction).
-      float stationHPa = bme.readPressure() / 100.0f;
-      // lastTempF is already the calibrated true temperature (offset applied
-      // at read time), so convert it to °C directly. Do NOT subtract the
-      // offset back out here -- that would feed the *uncalibrated* sensor
-      // reading into the pressure correction.
-      float tempC      = (lastTempF - 32.0f) * 5.0f / 9.0f;
-      float T_K        = tempC + 273.15f;
-      lastPressureHPa  = stationHPa * powf(1.0f + (0.0065f * lastAltitudeM) / T_K, 5.2561f);
+      // If you ever re-add the correction here, remove it there too.
+      lastPressureHPa = bme.readPressure() / 100.0f;
 
-      Serial.printf("TempF: %.2f (MCP9808)  Humidity: %.1f  SLP: %.1f hPa (alt %.0fm)  GPS sats: %lu\n",
-                    lastTempF, lastHumidity, lastPressureHPa, lastAltitudeM,
-                    gps.satellites.value());
+      Serial.printf("TempF: %.2f (MCP9808)  Humidity: %.1f  Station pressure: %.1f hPa\n",
+                    lastTempF, lastHumidity, lastPressureHPa);
     } else {
       Serial.println("BME280 not initialized -- skipping humidity/pressure read, retrying begin()");
       bmeOk = bme.begin(0x76) || bme.begin(0x77);
@@ -891,8 +793,11 @@ void loop() {
     }
   }
 
-  // Yield briefly instead of busy-spinning at full speed. The GPS UART
-  // buffer holds ~500ms of data at 9600 baud, so a 2ms nap costs nothing,
-  // and it lets the FreeRTOS idle task run (slightly less CPU heat/power).
-  delay(2);
+  // Yield instead of busy-spinning. The GPS build used 2ms because UART1 had
+  // to be drained promptly; with no UART there is nothing time-critical left
+  // in this loop -- AsyncWebServer and ESP-NOW are both interrupt/task
+  // driven, not polled here -- so a longer nap lets the FreeRTOS idle task
+  // run more and costs nothing. Don't push this much past ~10ms: the WiFi
+  // watchdog and history flush are still evaluated from here.
+  delay(10);
 }

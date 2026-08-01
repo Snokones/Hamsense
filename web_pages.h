@@ -85,6 +85,21 @@ a{color:var(--theme-main);text-decoration:none;margin-top:22px;display:block;tex
 .history-row .lbl{color:var(--theme-dim);font-size:0.75em;margin-right:8px;display:inline-block;min-width:2.6em;}
 .history-row .sep{color:var(--theme-dim);margin:0 4px;}
 .history-row .hunit{color:var(--theme-dim);font-size:0.75em;margin-left:4px;}
+/* ZIP entry + 5-day forecast -- same idiom as the other two panels, pinned
+   top-left (bottom corners are taken by history/indoor, top-right by the
+   theme button). */
+.forecast-panel{position:fixed;top:14px;left:14px;z-index:1;border:1px solid var(--theme-main);border-radius:8px;background:rgba(0,0,0,0.25);padding:10px 14px;text-align:left;color:var(--theme-main);font-family:Arial;min-width:200px;}
+.forecast-title{font-size:12px;color:var(--theme-dim);letter-spacing:0.08em;margin-bottom:6px;}
+.zip-row{display:flex;align-items:center;gap:7px;margin-bottom:7px;}
+.zip-input{width:5em;background:transparent;color:var(--theme-main);border:1px solid var(--theme-dim);border-radius:4px;font-family:Arial;font-size:13px;padding:2px 5px;}
+.zip-input:focus{outline:1px solid var(--theme-main);}
+.zip-place{font-size:11px;color:var(--theme-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:12em;}
+.forecast-row{font-size:15px;line-height:1.45;white-space:nowrap;}
+.forecast-row .lbl{color:var(--theme-dim);font-size:0.75em;margin-right:8px;display:inline-block;min-width:2.6em;}
+.forecast-row .sep{color:var(--theme-dim);margin:0 4px;}
+.forecast-row .funit{color:var(--theme-dim);font-size:0.75em;margin-left:4px;}
+.forecast-row .cond{color:var(--theme-dim);font-size:0.72em;margin-left:8px;}
+.forecast-note{font-size:10px;color:#999;margin-top:6px;max-width:15em;white-space:normal;line-height:1.35;}
 </style>
 </head><body>
 
@@ -98,10 +113,10 @@ a{color:var(--theme-main);text-decoration:none;margin-top:22px;display:block;tex
 </div>
 
 <div class='clock'>
-  <div><span class='tz-label'>UTC</span><span id='clockUtc'>--:--</span><span class='grid-sep'></span><span class='tz-label'>GRID</span><span id='gridSquare'>--</span><span class='grid-sep'></span><span class='tz-label'>↑</span><span id='sunrise'>--:--</span><span class='grid-sep'></span><span class='tz-label'>↓</span><span id='sunset'>--:--</span></div>
+  <div><span class='tz-label'>UTC</span><span id='clockUtc'>--:--</span><span class='grid-sep'></span><span class='tz-label'>↑</span><span id='sunrise'>--:--</span><span class='grid-sep'></span><span class='tz-label'>↓</span><span id='sunset'>--:--</span></div>
   <div>
     <select id='tzSelect' class='tz-select'></select>
-    <span id='clockLocal'>--:--</span><span class='grid-sep'></span><span id='gpsDate' class='tz-label'>--/--/----</span>
+    <span id='clockLocal'>--:--</span><span class='grid-sep'></span><span id='localDate' class='tz-label'>--/--/----</span>
   </div>
 </div>
 
@@ -132,25 +147,36 @@ a{color:var(--theme-main);text-decoration:none;margin-top:22px;display:block;tex
   </div>
 </div>
 
+<div class='forecast-panel'>
+  <div class='forecast-title'>5-DAY FORECAST</div>
+  <div class='zip-row'>
+    <input id='zipInput' class='zip-input' type='text' inputmode='numeric' maxlength='5' placeholder='ZIP' aria-label='ZIP code'/>
+    <span id='zipPlace' class='zip-place'>enter a ZIP</span>
+  </div>
+  <div id='fcRows'></div>
+  <div id='fcNote' class='forecast-note'></div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/topojson/3.0.2/topojson.min.js"></script>
 <script>
-// GPS pin layer -- defined here (before the map IIFE) so window.initMapPin
-// exists when the IIFE calls it during map setup. The WS handler in the
-// later script block calls window.setGpsPin once a fix arrives.
+// Location pin layer -- defined here (before the map IIFE) so window.initMapPin
+// exists when the IIFE calls it during map setup. In the GPS build this was
+// driven by a satellite fix; now the forecast module calls setLocationPin
+// once the entered ZIP resolves to coordinates.
 let _pinLayer = null;
 let _projectFn = null;
 window.initMapPin = function(layer, projFn) {
   _pinLayer = layer;
   _projectFn = projFn;
 };
-window.setGpsPin = function(lat, lon) {
+window.setLocationPin = function(lat, lon) {
   if (!_pinLayer || !_projectFn) return;
-  _pinLayer.selectAll('.gps-pin').remove();
+  _pinLayer.selectAll('.loc-pin').remove();
   const pt = _projectFn([lon, lat]);
   if (!pt) return;
   _pinLayer.append('circle')
-    .attr('class', 'gps-pin gps-pin-glow')
+    .attr('class', 'loc-pin loc-pin-glow')
     .attr('cx', pt[0]).attr('cy', pt[1])
     .attr('r', 12)
     .attr('fill', 'none')
@@ -158,7 +184,7 @@ window.setGpsPin = function(lat, lon) {
     .attr('stroke-width', 1.5)
     .attr('opacity', 0.4);
   _pinLayer.append('circle')
-    .attr('class', 'gps-pin gps-pin-dot')
+    .attr('class', 'loc-pin loc-pin-dot')
     .attr('cx', pt[0]).attr('cy', pt[1])
     .attr('r', 6)
     .attr('fill', getComputedStyle(document.documentElement).getPropertyValue('--theme-main').trim())
@@ -278,10 +304,10 @@ function terminatorLatLon(declDeg, subsolarLon) {
     terminatorColor = `rgba(${r},${g},${b},0.4)`;
     landLayer.selectAll('path').attr('stroke', strokeColor);
     nightLayer.selectAll('path.terminator-line').attr('stroke', terminatorColor);
-    // Repaint the GPS pin with the new theme color if one is showing
+    // Repaint the location pin with the new theme color if one is showing
     if (_pinLayer) {
-      _pinLayer.selectAll('.gps-pin-glow').attr('stroke', hexColor);
-      _pinLayer.selectAll('.gps-pin-dot').attr('fill', hexColor);
+      _pinLayer.selectAll('.loc-pin-glow').attr('stroke', hexColor);
+      _pinLayer.selectAll('.loc-pin-dot').attr('fill', hexColor);
     }
   };
 })();
@@ -352,47 +378,51 @@ function hPaToInHg(hpa) {
   return hpa * 0.0295299830714;
 }
 
-// ---- GPS-derived display functions ----
+// ---- Location-derived display functions ----
+// Everything here used to be fed by a GPS fix. It is now fed by the ZIP code
+// the user types into the forecast panel, which the last script block on this
+// page resolves into coordinates, elevation and a timezone.
 
-// Maidenhead grid square locator (4-character), computed from GPS coordinates.
-// The formula: divide adjusted lon/lat into field (A-R) and square (0-9) steps.
-// Verified against known references: Seattle=CN87, Manhattan=FN30, London=IO91.
-function maidenhead4(lat, lon) {
-  const lonAdj = lon + 180.0;
-  const latAdj = lat + 90.0;
-  const fLon = Math.floor(lonAdj / 20);
-  const fLat = Math.floor(latAdj / 10);
-  const sLon = Math.floor((lonAdj % 20) / 2);
-  const sLat = Math.floor(latAdj % 10);
-  return String.fromCharCode(65+fLon) + String.fromCharCode(65+fLat) + sLon + sLat;
-}
+// Station location: { lat, lon, elevM, tz, name }. Null until a ZIP resolves,
+// which is the normal state on a first visit -- every consumer below has to
+// tolerate it.
+let _loc = null;
 
-// Approximate IANA timezone from lat/lon for the US.
-// Uses longitude bands with explicit exceptions for Arizona (no DST) and
-// Alaska/Hawaii. Accurate for major US cities; known edge cases at state
-// borders (e.g. parts of Indiana, western Kentucky) may be one zone off.
-// The result is used to auto-select the existing timezone dropdown --
-// the user can always manually override if the guess is wrong.
-function approxTimezone(lat, lon) {
-  if (lat < 25 && lon < -140)   return 'Pacific/Honolulu';
-  if (lat > 54 || (lat > 50 && lon < -141)) return 'America/Anchorage';
-  if (lon < -114)                return 'America/Los_Angeles';
-  if (lon < -104) {
-    if (lat > 31 && lat < 37.5 && lon > -115) return 'America/Phoenix';
-    return 'America/Denver';
-  }
-  if (lon < -85.5)               return 'America/Chicago';
-  return 'America/New_York';
-}
+// Most recent WebSocket payload. Kept so the readouts can be re-rendered the
+// moment a location arrives, instead of showing uncorrected pressure until
+// the next push up to 30s later.
+let _lastWs = null;
 
-// Track whether the timezone was set by GPS (auto) vs the user manually.
-// Auto-selections can be overridden by the user; user selections persist and
-// won't be overwritten by future GPS auto-selects in the same session.
+// Track whether the timezone was set automatically (from the ZIP) or chosen
+// by the user. A user's explicit choice wins and is never overwritten.
 let tzSetByUser = false;
+
+// Sea-level pressure reduction -- ICAO standard barometric formula:
+//   SLP = P_station * (1 + (0.0065 * alt_m) / T_K) ^ 5.2561
+// This used to run on the ESP32 against GPS altitude. The altitude now comes
+// from the ZIP's elevation, which only the browser knows, so the firmware
+// sends RAW station pressure and the reduction happens here. Do not re-add it
+// to the firmware without deleting it here, or it applies twice.
+//
+// With no location yet, alt = 0 makes the factor exactly 1, so station
+// pressure passes through untouched -- the honest fallback, and the same
+// behaviour the firmware had before its first GPS fix.
+//
+// Uses the OUTDOOR temperature: the air column being modelled is the one
+// outside, between the station and sea level. If the MCP9808 is down the
+// firmware reports 0 F and this skews -- but a dead temperature sensor is
+// already obvious on the page, and at low elevations the error is a fraction
+// of a hPa.
+function toSeaLevel(stationHPa, outdoorTempF) {
+  if (!_loc || !isFinite(_loc.elevM) || _loc.elevM === 0) return stationHPa;
+  const tK = (outdoorTempF - 32) * 5 / 9 + 273.15;
+  if (!isFinite(tK) || tK <= 0) return stationHPa;
+  return stationHPa * Math.pow(1 + (0.0065 * _loc.elevM) / tK, 5.2561);
+}
 
 // NOAA sunrise/sunset algorithm -- same solar position math used for the
 // day/night terminator, applied here to find the exact rise/set times for
-// the user's GPS coordinates and the current GPS date.
+// the ZIP's coordinates on today's date.
 // Returns {sunrise, sunset} as Date objects in UTC, or null if polar day/night.
 function calcSunriseSunset(latDeg, lonDeg, year, month, day) {
   const lat = latDeg * Math.PI / 180;
@@ -433,43 +463,58 @@ function formatLocalTime(dateUtc) {
   }).format(dateUtc);
 }
 
-// Cache the last-known GPS position and date so sunrise/sunset can be
-// recomputed if the user changes timezone without waiting for the next WS push.
-let _lastGpsFix = null;
-
 function updateSunriseSunset() {
-  if (!_lastGpsFix) return;
-  const { lat, lon, year, mon, day } = _lastGpsFix;
-  const sun = calcSunriseSunset(lat, lon, year, mon, day);
+  const srEl = document.getElementById('sunrise');
+  const ssEl = document.getElementById('sunset');
+  if (!_loc) { srEl.textContent = '--:--'; ssEl.textContent = '--:--'; return; }
+  // Today's UTC date. The NOAA algorithm works in UTC and returns UTC
+  // instants, which formatLocalTime() then renders in the selected zone --
+  // same convention the GPS build used with the fix's own UTC date.
+  const now = new Date();
+  const sun = calcSunriseSunset(_loc.lat, _loc.lon,
+                                now.getUTCFullYear(), now.getUTCMonth() + 1, now.getUTCDate());
   if (sun) {
-    document.getElementById('sunrise').textContent = formatLocalTime(sun.sunrise);
-    document.getElementById('sunset').textContent  = formatLocalTime(sun.sunset);
+    srEl.textContent = formatLocalTime(sun.sunrise);
+    ssEl.textContent = formatLocalTime(sun.sunset);
   } else {
-    document.getElementById('sunrise').textContent = 'N/A';
-    document.getElementById('sunset').textContent  = 'N/A';
+    srEl.textContent = 'N/A'; // polar day or polar night
+    ssEl.textContent = 'N/A';
   }
 }
 
+// Date straight off the browser clock, rendered in the selected zone. The GPS
+// build reconstructed this from the fix's date fields; with no other date
+// source there is no reason not to use the browser's.
 function updateDate() {
-  if (!_lastGpsFix) return;
-  const { year, mon, day, ts } = _lastGpsFix;
-  if (!year || !mon || !day) return;
-  const gpsUtcMs = Date.UTC(year, mon-1, day,
-                            ts ? Math.floor((ts % 86400) / 3600) : 0,
-                            ts ? Math.floor((ts % 3600) / 60) : 0,
-                            ts ? (ts % 60) : 0);
-  document.getElementById('gpsDate').textContent = new Intl.DateTimeFormat('en-US', {
+  document.getElementById('localDate').textContent = new Intl.DateTimeFormat('en-US', {
     timeZone: document.getElementById('tzSelect').value || 'America/Los_Angeles',
     month: '2-digit', day: '2-digit', year: 'numeric'
-  }).format(new Date(gpsUtcMs));
+  }).format(new Date());
 }
 
+// Called by the forecast module once a ZIP resolves. Mirrors the
+// window.initMapPin / window.setLocationPin handoff used between script
+// blocks elsewhere on this page.
+window.setStationLocation = function(loc) {
+  _loc = loc;
+  if (window.setLocationPin) window.setLocationPin(loc.lat, loc.lon);
+  if (loc.tz && !tzSetByUser) selectTimezone(loc.tz, loc.name);
+  updateSunriseSunset();
+  updateDate();
+  // Re-render immediately so pressure picks up the elevation correction
+  // instead of waiting for the next 30s push.
+  if (_lastWs) renderReadings(_lastWs);
+};
+
 // ---- WebSocket handler ----
-connectWS((event)=>{
-  let data = JSON.parse(event.data);
+// Split out of the socket callback so setStationLocation() can re-run it the
+// moment a ZIP resolves -- both pressure readouts depend on the elevation.
+function renderReadings(data) {
   render('hum', data.h);
   render('temp', data.t);
-  render('press', hPaToInHg(data.p), 2);
+  // data.p is RAW station pressure from the BME280; reduce it here.
+  render('press', hPaToInHg(toSeaLevel(data.p, data.t)), 2);
+
   const statusEl = document.getElementById('timeStatus');
   if (data.sync) {
     statusEl.textContent = 'clock synced';
@@ -479,59 +524,28 @@ connectWS((event)=>{
     statusEl.className = 'status unsynced';
   }
 
-  // Handle GPS data if present and a fix is active
-  if (data.gps && data.gps.fix && data.gps.lat != null && data.gps.lon != null) {
-    const lat = data.gps.lat;
-    const lon = data.gps.lon;
-    const year = data.gps.year;
-    const mon  = data.gps.mon;
-    const day  = data.gps.day;
-
-    // Grid square
-    document.getElementById('gridSquare').textContent = maidenhead4(lat, lon);
-
-    // Cache for timezone-change recompute and update sunrise/sunset + date
-    _lastGpsFix = { lat, lon, year, mon, day, ts: data.ts };
-    updateSunriseSunset();
-    updateDate();
-
-    // Map pin
-    if (window.setGpsPin) window.setGpsPin(lat, lon);
-
-    // Auto-select timezone from GPS coordinates, but only if the user
-    // hasn't already manually chosen a timezone in this session.
-    if (!tzSetByUser) {
-      const ianaGuess = approxTimezone(lat, lon);
-      const sel = document.getElementById('tzSelect');
-      if (Array.from(sel.options).some(o => o.value === ianaGuess)) {
-        if (sel.value !== ianaGuess) {
-          sel.value = ianaGuess;
-          buildLocalFormatter(ianaGuess);
-          tickClock();
-          updateSunriseSunset(); // reformat with new zone
-        }
-      }
-    }
-  } else {
-    // No fix yet -- show placeholder
-    document.getElementById('gridSquare').textContent = '--';
-    document.getElementById('sunrise').textContent = '--:--';
-    document.getElementById('sunset').textContent  = '--:--';
-    document.getElementById('gpsDate').textContent = '--/--/----';
-  }
-
   // Indoor satellite panel. "ok" is false before the first report and
-  // whenever the node has gone quiet for 3+ minutes -- show "--" then
-  // rather than silently displaying stale data.
+  // whenever the node has gone quiet for 3+ minutes -- show "--" then rather
+  // than silently displaying stale data. Its pressure gets the same
+  // reduction, deliberately using the OUTDOOR temperature: the air column
+  // between the station and sea level is outside, and the indoor thermostat
+  // says nothing about it.
   if (data.in && data.in.ok) {
     document.getElementById('inHum').textContent   = data.in.h.toFixed(1);
     document.getElementById('inTemp').textContent  = data.in.t.toFixed(1);
-    document.getElementById('inPress').textContent = hPaToInHg(data.in.p).toFixed(2);
+    document.getElementById('inPress').textContent =
+      hPaToInHg(toSeaLevel(data.in.p, data.t)).toFixed(2);
   } else {
     document.getElementById('inHum').textContent   = '--';
     document.getElementById('inTemp').textContent  = '--';
     document.getElementById('inPress').textContent = '--';
   }
+}
+
+connectWS((event)=>{
+  const data = JSON.parse(event.data);
+  _lastWs = data;
+  renderReadings(data);
 });
 
 // Live UTC + selectable local clock, ticking off the browser's own clock
@@ -563,6 +577,29 @@ function buildLocalFormatter(iana) {
   localFormatter = new Intl.DateTimeFormat('en-US', {
     timeZone: iana, hour: '2-digit', minute: '2-digit', hour12: true
   });
+}
+
+// Point the clock at an arbitrary IANA zone, adding it to the dropdown if it
+// isn't one of the seven standard entries above. This matters: AccuWeather
+// returns the precise zone for a ZIP, which is often outside that list
+// (America/Detroit, America/Boise, America/Indiana/Indianapolis, ...).
+// Intl accepts any IANA zone, so the rest of the clock machinery is unchanged.
+// Deliberately does NOT persist the choice -- saving it would make the page
+// treat it as a user selection on the next load and stop honouring the ZIP.
+function selectTimezone(iana, label) {
+  const sel = document.getElementById('tzSelect');
+  // Drop any option left over from a previously entered ZIP.
+  Array.from(sel.options).forEach(o => { if (o.dataset.fromZip === '1') o.remove(); });
+  if (!Array.from(sel.options).some(o => o.value === iana)) {
+    const opt = document.createElement('option');
+    opt.value = iana;
+    opt.textContent = label || iana.split('/').pop().replace(/_/g, ' ');
+    opt.dataset.fromZip = '1';
+    sel.insertBefore(opt, sel.firstChild);
+  }
+  sel.value = iana;
+  buildLocalFormatter(iana);
+  tickClock();
 }
 
 function loadSavedTimezone() {
@@ -609,6 +646,10 @@ function tickClock() {
   const now = new Date();
   document.getElementById('clockUtc').textContent = utcFormatter.format(now);
   document.getElementById('clockLocal').textContent = localFormatter.format(now);
+  // The date now comes from this same browser clock rather than a GPS fix, so
+  // refresh it on the tick -- otherwise it would stay on yesterday's date
+  // until the next ZIP resolve or timezone change.
+  updateDate();
 }
 tickClock();
 setInterval(tickClock, 5000); // 5s is plenty now that only h:m is shown
@@ -740,6 +781,220 @@ applyTheme(loadSavedTheme());
   // Re-render on timezone change so day grouping and labels stay consistent.
   const sel = document.getElementById('tzSelect');
   if (sel) sel.addEventListener('change', loadHistory);
+})();
+</script>
+<script>
+// ---- ZIP entry + 5-day forecast (top-left panel) ----
+//
+// This runs in the BROWSER, not on the ESP32. The firmware has no HTTP client
+// and no TLS stack; adding one to a C6 already running AsyncWebServer +
+// LittleFS + ESP-NOW + ArduinoJson would cost heap and radio power for no
+// benefit, since the device viewing this page already has internet.
+//
+// QUOTA IS THE DESIGN CONSTRAINT HERE. AccuWeather's free tier is 50 calls per
+// day for the whole API key, shared by every browser that opens this page. So:
+//   * the ZIP -> location lookup is cached FOREVER (location keys are stable),
+//     costing one call per ZIP for the life of the browser profile;
+//   * the forecast is cached for 3 hours, and a page reload renders from that
+//     cache with ZERO calls.
+// That works out to ~8 calls/device/day. For scale: refreshing every 5 minutes
+// the way the history panel does would be 288 calls/day from a single tab and
+// would exhaust the quota before breakfast. Do not lower FORECAST_TTL_MS.
+//
+// The free tier also caps the daily forecast at 5 days (10- and 15-day are
+// paid), which is why this panel shows 5 and not 7.
+(function(){
+  const FORECAST_TTL_MS = 3 * 60 * 60 * 1000; // see quota note above
+  const ZIP_KEY = 'zipCode';
+  const AW = 'https://dataservice.accuweather.com';
+  function locKeyFor(zip){ return 'awLoc:' + zip; }
+  function fcKeyFor(zip){ return 'awFc:' + zip; }
+
+  const zipInput = document.getElementById('zipInput');
+  const zipPlace = document.getElementById('zipPlace');
+  const fcRows   = document.getElementById('fcRows');
+  const fcNote   = document.getElementById('fcNote');
+
+  let apiKey = null;
+  let busy = false;
+
+  // localStorage can throw in some privacy modes -- same defensive pattern the
+  // theme and timezone code already uses.
+  function lsGet(k){ try { return localStorage.getItem(k); } catch(e){ return null; } }
+  function lsSet(k,v){ try { localStorage.setItem(k,v); } catch(e){} }
+  function readJson(k){
+    const raw = lsGet(k);
+    if (!raw) return null;
+    try { return JSON.parse(raw); } catch(e){ return null; }
+  }
+  function note(msg){ fcNote.textContent = msg || ''; }
+
+  // IconPhrase is third-party text going into innerHTML -- escape it.
+  function escapeHtml(s){
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
+      return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+    });
+  }
+
+  // The key lives in secrets.h and is handed over by the auth-gated /config
+  // endpoint, so it never enters this committed file. Fetched once per load.
+  function getApiKey(){
+    if (apiKey) return Promise.resolve(apiKey);
+    return fetch('/config')
+      .then(function(r){ return r.json(); })
+      .then(function(c){ apiKey = c && c.awkey; return apiKey; });
+  }
+
+  function checkStatus(r){
+    if (r.status === 401 || r.status === 403) throw new Error('bad-key');
+    if (r.status === 503) throw new Error('quota');
+    if (!r.ok) throw new Error('http-' + r.status);
+    return r.json();
+  }
+
+  // ZIP -> { key, name, lat, lon, elevM, tz }, cached permanently: AccuWeather
+  // location keys don't change, so re-fetching one is a wasted call.
+  // details=true is REQUIRED -- without it the response carries no Elevation,
+  // and the pressure correction depends on it.
+  function resolveLocation(zip){
+    const cached = readJson(locKeyFor(zip));
+    if (cached && cached.key) return Promise.resolve(cached);
+    return getApiKey().then(function(k){
+      if (!k) throw new Error('no-key');
+      return fetch(AW + '/locations/v1/postalcodes/US/search?apikey=' + encodeURIComponent(k)
+                   + '&q=' + encodeURIComponent(zip) + '&details=true').then(checkStatus);
+    }).then(function(arr){
+      if (!arr || !arr.length) throw new Error('no-zip');
+      const L = arr[0];
+      const g = L.GeoPosition || {};
+      const hasElev = g.Elevation && g.Elevation.Metric && typeof g.Elevation.Metric.Value === 'number';
+      const loc = {
+        key:  L.Key,
+        name: (L.LocalizedName || zip) +
+              (L.AdministrativeArea && L.AdministrativeArea.ID ? ', ' + L.AdministrativeArea.ID : ''),
+        lat:  g.Latitude,
+        lon:  g.Longitude,
+        elevM: hasElev ? g.Elevation.Metric.Value : 0, // 0 = no correction applied
+        tz:   (L.TimeZone && L.TimeZone.Name) || null
+      };
+      lsSet(locKeyFor(zip), JSON.stringify(loc));
+      return loc;
+    });
+  }
+
+  // metric=false so temperatures arrive in F and match the rest of the page.
+  function loadForecast(zip, locationKey){
+    const cached = readJson(fcKeyFor(zip));
+    if (cached && cached.t && (Date.now() - cached.t) < FORECAST_TTL_MS) {
+      return Promise.resolve(cached.days); // cache hit -- no API call
+    }
+    return getApiKey().then(function(k){
+      if (!k) throw new Error('no-key');
+      return fetch(AW + '/forecasts/v1/daily/5day/' + encodeURIComponent(locationKey)
+                   + '?apikey=' + encodeURIComponent(k) + '&metric=false').then(checkStatus);
+    }).then(function(j){
+      const days = (j.DailyForecasts || []).map(function(d){
+        return {
+          epoch: d.EpochDate,
+          hi: (d.Temperature && d.Temperature.Maximum) ? d.Temperature.Maximum.Value : null,
+          lo: (d.Temperature && d.Temperature.Minimum) ? d.Temperature.Minimum.Value : null,
+          cond: (d.Day && d.Day.IconPhrase) || ''
+        };
+      });
+      lsSet(fcKeyFor(zip), JSON.stringify({ t: Date.now(), days: days }));
+      return days;
+    }).catch(function(err){
+      // Show stale data rather than blanking the panel on a transient failure.
+      if (cached && cached.days) { note('forecast stale (' + err.message + ')'); return cached.days; }
+      throw err;
+    });
+  }
+
+  function renderForecast(days){
+    const sel = document.getElementById('tzSelect');
+    const tz = (sel && sel.value) || 'America/Los_Angeles';
+    let html = '';
+    days.slice(0, 5).forEach(function(d){
+      const label = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short' })
+                      .format(new Date(d.epoch * 1000));
+      html += "<div class='forecast-row'><span class='lbl'>" + label + "</span>"
+            + "<span class='hi'>" + (d.hi == null ? '--' : Math.round(d.hi)) + "</span>"
+            + "<span class='sep'>/</span>"
+            + "<span class='lo'>" + (d.lo == null ? '--' : Math.round(d.lo)) + "</span>"
+            + "<span class='funit'>F</span>"
+            + "<span class='cond'>" + escapeHtml(d.cond) + "</span></div>";
+    });
+    fcRows.innerHTML = html;
+  }
+
+  const MESSAGES = {
+    'no-key':  'no API key -- set ACCUWEATHER_API_KEY in secrets.h',
+    'bad-key': 'API key rejected -- check ACCUWEATHER_API_KEY',
+    'quota':   'AccuWeather daily quota used up -- resets tomorrow',
+    'no-zip':  'ZIP not found'
+  };
+
+  function refresh(){
+    const zip = (lsGet(ZIP_KEY) || '').trim();
+    if (!/^\d{5}$/.test(zip)) {
+      zipPlace.textContent = 'enter a ZIP';
+      fcRows.innerHTML = '';
+      note('');
+      return;
+    }
+    if (busy) return;
+    busy = true;
+    note('');
+    resolveLocation(zip).then(function(loc){
+      zipPlace.textContent = loc.name;
+      // Hand the location to the rest of the page: the map pin, sunrise/sunset,
+      // the clock's timezone and the sea-level pressure correction all key off
+      // this one call.
+      if (window.setStationLocation) window.setStationLocation(loc);
+      return loadForecast(zip, loc.key);
+    }).then(function(days){
+      renderForecast(days);
+    }).catch(function(err){
+      if (MESSAGES[err.message]) {
+        note(MESSAGES[err.message]);
+      } else if (err instanceof TypeError) {
+        // fetch() rejects with TypeError when the browser blocks the response.
+        // For a cross-origin API that means CORS, which is worth naming: it
+        // cannot be fixed from this page.
+        note('request blocked (CORS or offline)');
+      } else {
+        note('forecast unavailable (' + err.message + ')');
+      }
+      zipPlace.textContent = zip;
+    }).then(function(){ busy = false; });
+  }
+
+  // --- wiring ---
+  zipInput.value = lsGet(ZIP_KEY) || '';
+
+  function commitZip(){
+    const v = zipInput.value.trim();
+    if (!/^\d{5}$/.test(v)) { note('ZIP must be 5 digits'); return; }
+    if (v === (lsGet(ZIP_KEY) || '')) return;
+    lsSet(ZIP_KEY, v);
+    fcRows.innerHTML = '';
+    refresh();
+  }
+  zipInput.addEventListener('change', commitZip);
+  zipInput.addEventListener('keydown', function(e){ if (e.key === 'Enter') commitZip(); });
+
+  // Re-label the day columns if the user switches timezone (no API call).
+  const tzSel = document.getElementById('tzSelect');
+  if (tzSel) tzSel.addEventListener('change', function(){
+    const zip = (lsGet(ZIP_KEY) || '').trim();
+    const c = /^\d{5}$/.test(zip) ? readJson(fcKeyFor(zip)) : null;
+    if (c && c.days) renderForecast(c.days);
+  });
+
+  refresh();
+  // Re-check on the cache TTL. Every tick before expiry is a cache hit, so
+  // this costs one call per 3 hours, not one per tick.
+  setInterval(refresh, FORECAST_TTL_MS);
 })();
 </script>
 
