@@ -589,7 +589,17 @@ void setup() {
   // on the C6, so firmware updates over USB are unaffected. Do NOT go lower
   // while WiFi is up, and do NOT reach for deep/light sleep on this node --
   // it serves an always-on page and must keep the USB port enumerated.
-  setCpuFrequencyMhz(80);
+  //
+  // Set BEFORE any WiFi call, which is why it sits this early in setup().
+  //
+  // DEBUG HANDLE: if you ever see a crash inside the WiFi driver -- ppTask,
+  // wifi_deinit, wDev_Rxbuf_Deinit, or a "CORRUPT HEAP" assert from
+  // multi_heap_poisoning -- put this back to 160 as the FIRST thing you try.
+  // 80MHz is a supported WiFi clock, but it halves the headroom of the WiFi
+  // protocol task, and the heap corruption fixed in the WiFi block below
+  // lived in precisely that task. Ruling the clock out takes one edit.
+  const uint32_t CPU_FREQ_MHZ = 80;
+  setCpuFrequencyMhz(CPU_FREQ_MHZ);
   Serial.printf("CPU frequency: %uMHz\n", getCpuFrequencyMhz());
 
   // --- Turn off the onboard yellow LED ---
@@ -689,6 +699,24 @@ void setup() {
   // 3 attempts (~15s each, ~45s worst case) before giving up on STA and
   // broadcasting our own network instead. If STA succeeds on any attempt,
   // AP/DNS never start at all -- behavior is identical to before.
+  //
+  // IMPORTANT -- do not "clean up" the disconnect calls below back into
+  // WiFi.disconnect(true). The bool argument is `wifioff`: passing true stops
+  // and tears the WiFi driver down, and doing that once per failed attempt
+  // drove a heap corruption inside the driver's own deinit path:
+  //
+  //   ppTask -> ieee80211_ioctl_process -> wifi_deinit -> ic_deinit
+  //          -> wDev_Rxbuf_Deinit -> esp_timer_delete -> multi_heap_free
+  //          -> verify_allocated_region -> assert -> panic_abort
+  //
+  //   CORRUPT HEAP: Bad tail at 0x408317bc. Expected 0xbaad5678 got 0xc034e7ec
+  //   assert failed: multi_heap_free multi_heap_poisoning.c:279 (head != NULL)
+  //
+  // It only reproduces on a boot where the home network is unreachable, since
+  // that is the only path that repeatedly deinits the radio. A plain
+  // disconnect just drops the association and leaves the driver initialised,
+  // which is all the retry loop actually needs.
+  WiFi.persistent(false); // don't rewrite credentials to NVS on every begin()
   WiFi.mode(WIFI_STA);
   const int WIFI_MAX_ATTEMPTS = 3;
   const uint32_t WIFI_ATTEMPT_TIMEOUT_MS = 15000;
@@ -705,8 +733,8 @@ void setup() {
     staConnected = (WiFi.status() == WL_CONNECTED);
     if (!staConnected) {
       Serial.println(" failed.");
-      WiFi.disconnect(true); // clean slate before the next attempt
-      delay(300);
+      WiFi.disconnect(false); // drop the association only -- see the note above
+      delay(500);             // let the driver settle before re-associating
     }
   }
 
@@ -719,7 +747,10 @@ void setup() {
     WiFi.setAutoReconnect(true);
   } else {
     Serial.println("\nCouldn't join home WiFi after 3 attempts -- starting fallback AP instead.");
-    WiFi.disconnect(true);
+    // Again: no wifioff. WiFi.mode() performs the STA->AP switch itself, and
+    // it does so without the full driver teardown that was corrupting the heap.
+    WiFi.disconnect(false);
+    delay(200);
     WiFi.mode(WIFI_AP);
     bool apOk = WiFi.softAP(FALLBACK_AP_SSID, FALLBACK_AP_PASSWORD);
     if (apOk) {
