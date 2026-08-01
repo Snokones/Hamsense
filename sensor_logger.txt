@@ -85,6 +85,7 @@
 // otherwise: "'IndoorReport' was not declared in this scope" errors
 // pointing at perfectly valid code.
 struct IndoorReport;
+struct SensorHealth;  // same reason -- sensorReport() takes one by reference
 
 // NOTE on the Arduino IDE's ctags-based auto-prototype-generator bug:
 // this sketch used to embed its HTML/JS pages directly in this .ino file,
@@ -115,6 +116,155 @@ void configureBme() {
 
 Adafruit_MCP9808 mcp;
 bool mcpOk = false;
+
+// ------------------------------------------------------------
+// Sensor fault reporting
+// ------------------------------------------------------------
+// Policy: log on STATE CHANGE, not on every cycle. The earlier version
+// printed "not initialized" on every failed read, which at a 30s cadence
+// buries every other message within minutes -- and it still never told you
+// when a sensor came back. Each sensor now carries a health record, so the
+// log reads as events (FAILED / RECOVERED) rather than a wall of identical
+// lines, and a sensor that flaps is visible as flapping.
+struct SensorHealth {
+  const char*   name;
+  uint8_t       addr;             // primary I2C address, probed when a fault is reported
+  uint8_t       addrAlt;          // secondary address (BME280 strapping); 0 = none
+  bool          ok;               // did the last read/init succeed?
+  bool          everOk;           // has it worked at any point since boot?
+  bool          failureAnnounced; // did we actually print a FAILED line for the current outage?
+  uint32_t      consecFails;      // consecutive failures, reset on success
+  uint32_t      totalFails;       // cumulative since boot
+  unsigned long lastGoodMs;       // millis() of the last valid reading
+  unsigned long lastReportMs;     // millis() of our last printed line for this sensor; 0 = never
+};
+SensorHealth mcpHealth = { "MCP9808", 0x18, 0x00, false, false, false, 0, 0, 0, 0 };
+SensorHealth bmeHealth = { "BME280",  0x76, 0x77, false, false, false, 0, 0, 0, 0 };
+
+// How often a still-broken sensor re-announces itself, counted in failed
+// attempts. At a 30s read interval, 20 attempts is roughly every 10 minutes:
+// often enough that a dead sensor is obvious in a log you scroll into hours
+// later, rare enough that it doesn't drown the console.
+const uint32_t FAULT_REPEAT_EVERY = 20;
+
+// Minimum gap between printed lines for a single sensor. This exists for the
+// marginal-connection case: a sensor that fails and recovers on alternating
+// cycles would otherwise cost a multi-line FAILED block plus a RECOVERED line
+// every cycle -- noisier than the naive per-cycle logging this replaced.
+// The first-ever report for a sensor bypasses this, so a device that is
+// missing at boot is announced immediately rather than ten minutes later.
+const unsigned long FAULT_MIN_GAP_MS = 60000;
+
+// Decode Wire.endTransmission()'s return code. This is the difference between
+// "nothing is answering at that address" and "the bus itself is jammed" --
+// two very different wiring faults that both surface as begin() returning
+// false and nothing else.
+const char* i2cErrorText(uint8_t code) {
+  switch (code) {
+    case 0: return "ok";
+    case 1: return "data too long for buffer";
+    case 2: return "NACK on address -- nothing is responding here";
+    case 3: return "NACK on data -- device answered, then stopped";
+    case 4: return "bus error -- check SDA/SCL wiring and pull-ups";
+    case 5: return "timeout -- bus held low by a wedged device or a short";
+    default: return "unrecognised error code";
+  }
+}
+
+// Probe one address without transferring data. Returns the endTransmission code.
+uint8_t i2cProbe(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission();
+}
+
+// Full bus scan. Cheap (127 probes, a few ms) and it turns "sensor not found"
+// into "here is exactly what IS on the bus", which separates a wrong address
+// from a dead bus from a power fault at a glance.
+void i2cScan() {
+  Serial.println("[I2C] scanning bus...");
+  int found = 0;
+  for (uint8_t a = 1; a < 127; a++) {
+    if (i2cProbe(a) == 0) {
+      const char *known = "";
+      if      (a == 0x18)               known = "   <- MCP9808 (temperature)";
+      else if (a == 0x76 || a == 0x77)  known = "   <- BME280 (humidity/pressure)";
+      Serial.printf("[I2C]   found 0x%02X%s\n", a, known);
+      found++;
+    }
+  }
+  if (found == 0) {
+    Serial.println("[I2C]   NO DEVICES FOUND.");
+    Serial.println("[I2C]   Check SDA=D4, SCL=D5, both sensors on 3V3 and GND,");
+    Serial.println("[I2C]   and that at least one board provides bus pull-ups.");
+  } else {
+    Serial.printf("[I2C] scan complete -- %d device(s) present.\n", found);
+  }
+}
+
+// Record the outcome of a read or init attempt and decide whether it is worth
+// a line of Serial output. Call it on EVERY attempt, success or failure --
+// it does the filtering.
+void sensorReport(SensorHealth &h, bool nowOk, const char *detail) {
+  unsigned long now = millis();
+
+  if (nowOk) {
+    if (!h.ok) {  // transition into working
+      if (h.failureAnnounced) {
+        Serial.printf("[SENSOR] %s RECOVERED after %lu consecutive failure(s).\n",
+                      h.name, (unsigned long)h.consecFails);
+        h.lastReportMs     = now;
+        h.failureAnnounced = false;
+      } else if (!h.everOk) {
+        Serial.printf("[SENSOR] %s online.\n", h.name);
+        h.lastReportMs = now;
+      }
+      // If the matching failure was rate-limited away, stay quiet about the
+      // recovery too -- printing half of each flap is just noise.
+    }
+    h.ok          = true;
+    h.everOk      = true;
+    h.consecFails = 0;
+    h.lastGoodMs  = now;
+    return;
+  }
+
+  h.consecFails++;
+  h.totalFails++;
+
+  bool startOfOutage = (h.consecFails == 1);
+  bool periodicDue   = (h.consecFails % FAULT_REPEAT_EVERY) == 0;
+  bool everPrinted   = (h.lastReportMs != 0);
+  bool tooSoon       = everPrinted && (now - h.lastReportMs) < FAULT_MIN_GAP_MS;
+
+  // startOfOutage rather than "was previously ok": at boot h.ok is already
+  // false, so keying off the transition alone would make a sensor that is
+  // simply not plugged in fail completely silently.
+  if ((startOfOutage || periodicDue) && !tooSoon) {
+    Serial.printf("[SENSOR] %s FAILED (%lu consecutive, %lu total): %s\n",
+                  h.name, (unsigned long)h.consecFails, (unsigned long)h.totalFails,
+                  detail ? detail : "no detail given");
+
+    // The multi-line diagnostic block is reserved for the two cases where it
+    // earns its space: the first failure since boot (you are debugging wiring)
+    // and the periodic re-announce during a sustained outage. Emitting it on
+    // every transition made a sensor with a marginal connection noisier than
+    // the naive per-cycle logging this replaced. It also means the I2C bus
+    // isn't probed on every flap, which matters when the bus is the fault.
+    if (h.totalFails == 1 || periodicDue) {
+      if (h.everOk && h.lastGoodMs) {
+        Serial.printf("[SENSOR]   last good reading was %lus ago.\n",
+                      (unsigned long)((now - h.lastGoodMs) / 1000UL));
+      }
+      Serial.printf("[SENSOR]   I2C 0x%02X -> %s\n", h.addr, i2cErrorText(i2cProbe(h.addr)));
+      if (h.addrAlt) {
+        Serial.printf("[SENSOR]   I2C 0x%02X -> %s\n", h.addrAlt, i2cErrorText(i2cProbe(h.addrAlt)));
+      }
+    }
+    h.lastReportMs     = now;
+    h.failureAnnounced = true;
+  }
+  h.ok = false;
+}
 
 // ---- Async server + WebSocket ----
 AsyncWebServer server(80);
@@ -204,6 +354,14 @@ IndoorReport  indoorLast = {};
 bool          indoorEverReceived = false;
 unsigned long indoorLastMs = 0;
 uint32_t      indoorLastPrintedSeq = 0; // loop()-side only, no lock needed
+bool          indoorWasStale = false;   // loop()-side edge detector for link-lost logging
+
+// Periodic one-line summary of every subsystem, so a console you scroll into
+// hours later tells you the current state without needing to catch a
+// transition. 10 minutes is frequent enough to be useful, rare enough to stay
+// out of the way.
+const unsigned long HEALTH_REPORT_MS = 600000;
+unsigned long lastHealthReport = 0;
 
 // If no report arrives for 3 minutes (three missed 1-minute cycles), the
 // page shows the indoor panel as stale ("--") rather than silently
@@ -294,7 +452,12 @@ void onWsEvent(AsyncWebSocket *server,
 void historyAppend(uint32_t epoch, float tF) {
   if (!littleFsOk) return;
   File f = LittleFS.open(HISTORY_PATH, "r+");
-  if (!f) return;
+  if (!f) {
+    // Previously a silent return -- a full or failing flash would quietly
+    // stop recording history with nothing in the log to explain the gap.
+    Serial.printf("[HIST] ERROR: cannot open %s for writing. This sample is lost.\n", HISTORY_PATH);
+    return;
+  }
   uint32_t oldestEpoch = 0xFFFFFFFFUL;
   int      oldestSlot  = 0;
   for (int i = 0; i < HISTORY_CAPACITY; i++) {
@@ -308,8 +471,12 @@ void historyAppend(uint32_t epoch, float tF) {
   }
   TempSample rec = { epoch, tF };
   f.seek((uint32_t)oldestSlot * sizeof(TempSample), SeekSet);
-  f.write((const uint8_t*)&rec, sizeof(rec));
+  size_t wrote = f.write((const uint8_t*)&rec, sizeof(rec));
   f.close();
+  if (wrote != sizeof(rec)) {
+    Serial.printf("[HIST] ERROR: short write (%u of %u bytes) into slot %d -- flash full or failing.\n",
+                  (unsigned)wrote, (unsigned)sizeof(rec), oldestSlot);
+  }
 }
 
 // Serialize the stored samples to JSON: {"unit":"F","interval_s":900,
@@ -450,6 +617,11 @@ void setup() {
   // updating your arduino-esp32 core version.
   Serial.printf("I2C bus timeout: %ums\n", Wire.getTimeOut());
 
+  // Enumerate the bus before touching either sensor. If a begin() fails
+  // below, this scan is what tells you whether the device is absent, at an
+  // unexpected address, or the whole bus is down.
+  i2cScan();
+
   // --- LittleFS: persistent store for the temperature history (/temps.bin) ---
   // format-on-fail (true) so a blank or corrupt flash comes up usable instead
   // of leaving history permanently dead. If the history file is absent or the
@@ -490,9 +662,11 @@ void setup() {
   }
   if (bmeOk) {
     configureBme();
-    Serial.println("BME280 found and initialized (humidity + pressure, forced/weather mode).");
+    sensorReport(bmeHealth, true, nullptr);
+    Serial.println("[SENSOR]   humidity + pressure, forced/weather mode.");
   } else {
-    Serial.println("WARNING: BME280 not found at 0x76 or 0x77 -- check wiring. Will keep retrying in loop().");
+    sensorReport(bmeHealth, false, "begin() failed at both 0x76 and 0x77");
+    Serial.println("[SENSOR]   will keep retrying every read cycle -- no reboot needed.");
   }
 
   // MCP9808 -- precision temperature sensor, I2C address 0x18 (default,
@@ -500,10 +674,12 @@ void setup() {
   // your breakout, update the address here accordingly.
   mcpOk = mcp.begin(0x18);
   if (mcpOk) {
-    mcp.setResolution(3); // max resolution: 0.0625°C / read time ~250ms -- fine at 10s interval
-    Serial.println("MCP9808 found and initialized (temperature).");
+    mcp.setResolution(3); // max resolution: 0.0625°C / read time ~250ms -- fine at a 30s interval
+    sensorReport(mcpHealth, true, nullptr);
+    Serial.println("[SENSOR]   temperature, resolution 3 (0.0625C).");
   } else {
-    Serial.println("WARNING: MCP9808 not found at 0x18 -- check wiring. Will keep retrying in loop().");
+    sensorReport(mcpHealth, false, "begin() failed at 0x18");
+    Serial.println("[SENSOR]   if your breakout has address pins strapped, update the address here.");
   }
 
   // (No GPS UART in this build. D6/D7 and UART1 are unused and left
@@ -716,12 +892,40 @@ void loop() {
     lastSensorRead = now;
 
     // Temperature from MCP9808 (primary, high-precision sensor).
+    // A sensor that falls off the bus mid-session does NOT make begin() fail
+    // again -- mcpOk stays true and readTempF() just starts returning NaN. So
+    // validate every reading, not just the init. Without this, NaN flows into
+    // the WebSocket JSON and the page's digit renderer (which does
+    // Number(NaN).toFixed() then indexes a segment map) breaks on it.
     if (mcpOk) {
-      lastTempF = mcp.readTempF() + TEMP_OFFSET_F;
+      float tF = mcp.readTempF();
+      if (isnan(tF)) {
+        sensorReport(mcpHealth, false, "read returned NaN -- sensor stopped responding");
+        mcpOk = false;
+      } else if (tF < -40.0f || tF > 257.0f) {
+        // The MCP9808's own spec is -40..+125C (-40..257F). Outside that is a
+        // fault word or a garbled transfer, not weather.
+        char why[80];
+        snprintf(why, sizeof(why), "reading %.1fF is outside the sensor's -40..257F range", tF);
+        sensorReport(mcpHealth, false, why);
+        mcpOk = false;
+      } else {
+        lastTempF = tF + TEMP_OFFSET_F;
+        sensorReport(mcpHealth, true, nullptr);
+      }
+      // Note: on failure lastTempF keeps its last good value rather than being
+      // zeroed. The [READ] line below prints "--" so the log doesn't imply the
+      // stale number is live.
     } else {
-      Serial.println("MCP9808 not initialized -- skipping temp read, retrying begin()");
+      // Retry begin() so a sensor connected or reseated after boot recovers
+      // without a reboot.
       mcpOk = mcp.begin(0x18);
-      if (mcpOk) mcp.setResolution(3); // match the boot path so a recovered sensor runs at full resolution
+      if (mcpOk) {
+        mcp.setResolution(3); // match the boot path so a recovered sensor runs at full resolution
+        sensorReport(mcpHealth, true, nullptr);
+      } else {
+        sensorReport(mcpHealth, false, "begin() retry failed -- device not responding");
+      }
     }
 
     // --- Intra-day temperature history ---
@@ -747,27 +951,61 @@ void loop() {
       }
     }
 
-    // Humidity + pressure from BME280.
+    // Humidity + pressure from BME280. Same silent-failure mode as the
+    // MCP9808: the library keeps reporting success while the chip returns NaN.
     if (bmeOk) {
       // Forced mode: the sensor idles until we explicitly trigger one
       // conversion. Blocks ~10ms at 1x oversampling -- negligible at a
       // 30-second read interval.
       bme.takeForcedMeasurement();
-      lastHumidity    = bme.readHumidity();
+      float hum  = bme.readHumidity();
       // RAW station pressure -- no sea-level reduction here. The ICAO
       // correction needs a station altitude, which used to come from the GPS
       // and now comes from the ZIP code's elevation, which only the browser
       // knows. web_pages.h applies:
       //   SLP = P_station * (1 + (0.0065 * alt_m) / T_K) ^ 5.2561
       // If you ever re-add the correction here, remove it there too.
-      lastPressureHPa = bme.readPressure() / 100.0f;
+      float hpa = bme.readPressure() / 100.0f;
 
-      Serial.printf("TempF: %.2f (MCP9808)  Humidity: %.1f  Station pressure: %.1f hPa\n",
-                    lastTempF, lastHumidity, lastPressureHPa);
+      if (isnan(hum) || isnan(hpa)) {
+        sensorReport(bmeHealth, false, "read returned NaN -- sensor stopped responding");
+        bmeOk = false;
+      } else if (hum < 0.0f || hum > 100.0f) {
+        char why[80];
+        snprintf(why, sizeof(why), "humidity %.1f%% is outside 0-100%%", hum);
+        sensorReport(bmeHealth, false, why);
+        bmeOk = false;
+      } else if (hpa < 300.0f || hpa > 1100.0f) {
+        // Deliberately wide: 300-1100 hPa spans a hurricane at sea level to
+        // the summit of Everest, so this only trips on genuinely broken data.
+        char why[88];
+        snprintf(why, sizeof(why), "pressure %.1f hPa is outside the plausible 300-1100 hPa", hpa);
+        sensorReport(bmeHealth, false, why);
+        bmeOk = false;
+      } else {
+        lastHumidity    = hum;
+        lastPressureHPa = hpa;
+        sensorReport(bmeHealth, true, nullptr);
+      }
     } else {
-      Serial.println("BME280 not initialized -- skipping humidity/pressure read, retrying begin()");
       bmeOk = bme.begin(0x76) || bme.begin(0x77);
-      if (bmeOk) configureBme(); // match the boot path on recovery
+      if (bmeOk) {
+        configureBme(); // match the boot path on recovery
+        sensorReport(bmeHealth, true, nullptr);
+      } else {
+        sensorReport(bmeHealth, false, "begin() retry failed at both 0x76 and 0x77");
+      }
+    }
+
+    // One consolidated reading line. A sensor that is currently faulted prints
+    // "--" rather than its last good value, so nothing in the log looks live
+    // when it isn't.
+    {
+      char tBuf[16], hBuf[16], pBuf[20];
+      if (mcpHealth.ok) snprintf(tBuf, sizeof(tBuf), "%.2fF", lastTempF);       else strcpy(tBuf, "--");
+      if (bmeHealth.ok) snprintf(hBuf, sizeof(hBuf), "%.1f%%", lastHumidity);   else strcpy(hBuf, "--");
+      if (bmeHealth.ok) snprintf(pBuf, sizeof(pBuf), "%.1f hPa", lastPressureHPa); else strcpy(pBuf, "--");
+      Serial.printf("[READ] temp %s | humidity %s | station pressure %s\n", tBuf, hBuf, pBuf);
     }
 
     // Push to WebSocket clients as long as at least one sensor gave us data.
@@ -785,12 +1023,59 @@ void loop() {
     bool          inRcvd;
     unsigned long inMs;
     snapshotIndoor(inCopy, inRcvd, inMs);
+
     if (inRcvd && inCopy.seq != indoorLastPrintedSeq) {
+      // The satellite's sequence counter lives in RTC memory, which survives
+      // deep sleep but not power loss -- so a counter that jumps BACKWARDS
+      // means the node rebooted, and a forward jump means reports were lost
+      // in the air. Both are worth knowing when the radio link is what you're
+      // debugging; neither is visible from the web page.
+      if (indoorLastPrintedSeq != 0) {
+        if (inCopy.seq < indoorLastPrintedSeq) {
+          Serial.printf("[SAT] sequence reset (%lu -> %lu) -- satellite lost power or was reflashed.\n",
+                        (unsigned long)indoorLastPrintedSeq, (unsigned long)inCopy.seq);
+        } else if (inCopy.seq > indoorLastPrintedSeq + 1) {
+          Serial.printf("[SAT] %lu report(s) missed (seq %lu -> %lu).\n",
+                        (unsigned long)(inCopy.seq - indoorLastPrintedSeq - 1),
+                        (unsigned long)indoorLastPrintedSeq, (unsigned long)inCopy.seq);
+        }
+      }
       indoorLastPrintedSeq = inCopy.seq;
-      Serial.printf("Indoor satellite: %.1fF  %.1f%%  %.1f hPa  (seq %lu)\n",
+      if (indoorWasStale) {
+        Serial.println("[SAT] link RECOVERED.");
+        indoorWasStale = false;
+      }
+      Serial.printf("[SAT] %.1fF | %.1f%% | %.1f hPa | seq %lu\n",
                     inCopy.tempF, inCopy.humidity, inCopy.pressureHPa,
                     (unsigned long)inCopy.seq);
     }
+
+    // Link-lost edge. The page already greys the indoor panel out after
+    // INDOOR_STALE_MS; this puts the same transition on the console, which is
+    // where you are looking when the satellite is the suspect.
+    if (inRcvd && !indoorWasStale && (millis() - inMs) >= INDOOR_STALE_MS) {
+      indoorWasStale = true;
+      Serial.printf("[SAT] LINK LOST -- no report for %lus (expected one per minute).\n",
+                    (unsigned long)((millis() - inMs) / 1000UL));
+    }
+  }
+
+  // --- Periodic health summary ---
+  if (now - lastHealthReport >= HEALTH_REPORT_MS) {
+    lastHealthReport = now;
+    IndoorReport  inCopy;
+    bool          inRcvd;
+    unsigned long inMs;
+    snapshotIndoor(inCopy, inRcvd, inMs);
+    Serial.printf("[HEALTH] up %lum | MCP9808 %s (%lu fails) | BME280 %s (%lu fails) | "
+                  "satellite %s | LittleFS %s | WiFi %s | heap %u B\n",
+                  (unsigned long)(now / 60000UL),
+                  mcpHealth.ok ? "ok" : "FAULT", (unsigned long)mcpHealth.totalFails,
+                  bmeHealth.ok ? "ok" : "FAULT", (unsigned long)bmeHealth.totalFails,
+                  !inRcvd ? "never seen" : ((millis() - inMs) < INDOOR_STALE_MS ? "ok" : "STALE"),
+                  littleFsOk ? "ok" : "FAULT",
+                  runningAsAP ? "AP fallback" : (WiFi.status() == WL_CONNECTED ? "connected" : "DOWN"),
+                  (unsigned)ESP.getFreeHeap());
   }
 
   // Yield instead of busy-spinning. The GPS build used 2ms because UART1 had
