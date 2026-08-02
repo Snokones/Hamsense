@@ -1,10 +1,10 @@
-# HamSense — `no-gps` branch
+# Hamsense
 
 A two-node ESP32-C6 weather station. A **base station** reads outdoor temperature, humidity and pressure, then serves a live web page over WiFi. A battery-powered **indoor satellite** wakes once a minute, takes a reading, radios it to the base over ESP-NOW, and goes back to deep sleep.
 
 Both nodes run on the [Seeed XIAO ESP32-C6](https://wiki.seeedstudio.com/xiao_esp32c6_getting_started/).
 
-> **This branch has no GPS.** The ATGM336H and TinyGPS++ are gone. Everything the GPS supplied now comes from a ZIP code you type into the web page, which is resolved through AccuWeather:
+> **No GPS.** The ATGM336H and TinyGPS++ are gone. Everything the GPS supplied now comes from a ZIP code you type into the web page, which is resolved through AccuWeather. The older GPS build is preserved on the [`gps`](https://github.com/Snokones/Hamsense/tree/gps) branch.
 >
 > | GPS gave us | now comes from |
 > |---|---|
@@ -35,7 +35,7 @@ Reads sensors, keeps time, and serves the UI.
 
 **Time source:** NTP only. See the AP-mode caveat at the top.
 
-**Power:** the base serves an always-on page, so it never sleeps — deep or light sleep would kill both the web server and the USB port you flash it through. The savings on this branch come from deleting the GPS (~25–30 mA) and running the CPU at 80 MHz (~15–25 mA), which is the floor with WiFi active. Expect roughly 40–55 mA less than the GPS build.
+**Power:** the base serves an always-on page, so it never sleeps — deep or light sleep would kill both the web server and the USB port you flash it through. The savings come from deleting the GPS (~25–30 mA) and running the CPU at 80 MHz (~15–25 mA), which is the floor with WiFi active. Measured **18 mA at 13.2 V** through a PFM buck to the XIAO's 5 V pin, roughly 45 % below the GPS build.
 
 **WiFi with fallback:** tries your home network 3× (~15 s each). If it can't join, it broadcasts its own AP (`PotaSense`) with a DNS server that redirects every lookup to the live page, so the UI is reachable with no home WiFi around. A watchdog reboots the device if WiFi stays down for 5 minutes (station mode) or it sits idle 10+ minutes in AP fallback.
 
@@ -60,7 +60,7 @@ Both sensors share the I2C bus on the base (SDA = D4, SCL = D5, 3V3 / GND).
 | MCP9808  | I2C (SDA=D4, SCL=D5), address `0x18`                     |
 | BME280   | I2C (SDA=D4, SCL=D5), address `0x76` or `0x77`           |
 
-UART1 and pins D6/D7 are unused on this branch — nothing should be wired to them.
+UART1 and pins D6/D7 are unused — nothing should be wired to them.
 
 **Satellite (XIAO ESP32-C6):**
 
