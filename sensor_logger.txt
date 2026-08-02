@@ -1,29 +1,56 @@
 /*
-  ESP32-C6 multi-sensor station - temperature (MCP9808), humidity + pressure
-  (BME280), and GPS (ATGM336H)
-  - AsyncWebServer + WebSocket, single live page
-  - GPS UTC time as primary clock source (NTP as fallback when GPS has no fix)
-  - Temperature from MCP9808 (high-precision I2C, ±0.25°C typical accuracy)
-  - Humidity + pressure from BME280 (I2C)
-  - GPS position from ATGM336H (UART1, D6=TX, D7=RX, 9600 baud, TinyGPS++)
+  ESP32-C6 multi-sensor station - temperature (MCP9808) + humidity/pressure
+  (BME280).  NO-GPS VARIANT.
+
+  This is the no-GPS build of the base station. The ATGM336H and TinyGPS++
+  are gone entirely; everything the GPS used to supply now comes from a ZIP
+  code the user enters on the web page:
+
+    GPS gave us          ->  now comes from
+    -------------------      ------------------------------------------
+    UTC time (primary)   ->  NTP only (see the AP-mode caveat below)
+    latitude/longitude   ->  AccuWeather location lookup for the ZIP
+    altitude             ->  same lookup (GeoPosition.Elevation), applied
+                             browser-side, so the firmware no longer does
+                             any sea-level-pressure correction at all
+    date                 ->  the browser's own clock
+
+  Consequences worth knowing:
+  - Pressure sent over the WebSocket is now RAW STATION PRESSURE, both for
+    the outdoor BME280 ("p") and the indoor satellite ("in"."p"). The page
+    applies the ICAO sea-level correction using the ZIP's elevation. Do not
+    re-add the correction here without also removing it from web_pages.h,
+    or it will be applied twice.
+  - NTP is the ONLY clock source now. In "PotaSense" AP-fallback mode there
+    is no internet, so the clock never syncs -- and because history writes
+    are gated on a synced clock, no history is recorded while in AP mode.
+    GPS used to cover that case. A DS3231 RTC is the cheap fix if it ever
+    matters; re-adding GPS is not.
+
+  Other features (unchanged from the GPS build):
+  - AsyncWebServer + WebSocket, single live page, HTTP Basic Auth
   - ESP-NOW receiver for the indoor satellite node (satellite_sensor.ino,
     a XIAO ESP32-C6 + BME280 that deep-sleeps and reports every minute);
     the IndoorReport struct here must match the satellite's exactly
-  - 10s sampling, pushed live to connected clients over WebSocket
-  - Seven-segment display: temp (MCP9808), humidity + pressure (BME280),
-    day/night Mercator map background, WS auto-reconnect
+  - 30s sampling, pushed live to connected clients over WebSocket
+  - 7-day temperature history on flash (LittleFS), served at GET /history
+  - Seven-segment display, day/night Mercator map, WS auto-reconnect
   - WiFi: tries the home network (3 attempts), falls back to broadcasting
     its own AP ("PotaSense") with a DNS redirect if it can't connect
+
+  Power: this board serves an always-on web page, so it never sleeps. The
+  savings here come from deleting the GPS (~25-30mA) and running the CPU at
+  80MHz. Deep/light sleep is deliberately NOT used -- it would kill both the
+  web server and the USB CDC port used for firmware updates.
 
   Wiring (XIAO ESP32-C6):
     MCP9808:   I2C (SDA=D4, SCL=D5), 3V3/GND, default address 0x18
     BME280:    I2C (SDA=D4, SCL=D5), 3V3/GND, address 0x76 or 0x77
-    ATGM336H:  GPS TX -> D7 (ESP32 RX), GPS RX -> D6 (ESP32 TX), 3V3/GND
+    (UART1 / D6 / D7 are now free -- nothing is connected to them.)
 
   Required libraries (Arduino Library Manager):
     "Adafruit BME280 Library" + dependency "Adafruit Unified Sensor"
     "Adafruit MCP9808 Library"
-    "TinyGPSPlus" by Mikal Hart
 */
 
 
@@ -40,9 +67,16 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <Adafruit_MCP9808.h>
-#include <TinyGPSPlus.h>
 #include <LittleFS.h>  // on-flash temperature history (/temps.bin) -- part of the ESP32 core
 #include "secrets.h"   // WIFI_SSID / WIFI_PASSWORD live here -- not in this file, not in git
+
+// Fail the build loudly rather than shipping an empty key and debugging a
+// silently broken forecast panel later. Same philosophy as WEB_USER/WEB_PASS:
+// if it's required, its absence should be a compile error, not a runtime
+// surprise. Get a free key at https://developer.accuweather.com/.
+#ifndef ACCUWEATHER_API_KEY
+#error "ACCUWEATHER_API_KEY missing from secrets.h -- copy secrets.h.example and fill it in."
+#endif
 
 // Forward declaration for the Arduino IDE's auto-prototype generator: it
 // inserts function prototypes near the top of the file, BEFORE our type
@@ -51,6 +85,7 @@
 // otherwise: "'IndoorReport' was not declared in this scope" errors
 // pointing at perfectly valid code.
 struct IndoorReport;
+struct SensorHealth;  // same reason -- sensorReport() takes one by reference
 
 // NOTE on the Arduino IDE's ctags-based auto-prototype-generator bug:
 // this sketch used to embed its HTML/JS pages directly in this .ino file,
@@ -82,40 +117,153 @@ void configureBme() {
 Adafruit_MCP9808 mcp;
 bool mcpOk = false;
 
-// GPS (ATGM336H on UART1: D6=TX GPIO16, D7=RX GPIO17, 9600 baud)
-TinyGPSPlus gps;
-HardwareSerial gpsSerial(1); // UART1
+// ------------------------------------------------------------
+// Sensor fault reporting
+// ------------------------------------------------------------
+// Policy: log on STATE CHANGE, not on every cycle. The earlier version
+// printed "not initialized" on every failed read, which at a 30s cadence
+// buries every other message within minutes -- and it still never told you
+// when a sensor came back. Each sensor now carries a health record, so the
+// log reads as events (FAILED / RECOVERED) rather than a wall of identical
+// lines, and a sensor that flaps is visible as flapping.
+struct SensorHealth {
+  const char*   name;
+  uint8_t       addr;             // primary I2C address, probed when a fault is reported
+  uint8_t       addrAlt;          // secondary address (BME280 strapping); 0 = none
+  bool          ok;               // did the last read/init succeed?
+  bool          everOk;           // has it worked at any point since boot?
+  bool          failureAnnounced; // did we actually print a FAILED line for the current outage?
+  uint32_t      consecFails;      // consecutive failures, reset on success
+  uint32_t      totalFails;       // cumulative since boot
+  unsigned long lastGoodMs;       // millis() of the last valid reading
+  unsigned long lastReportMs;     // millis() of our last printed line for this sensor; 0 = never
+};
+SensorHealth mcpHealth = { "MCP9808", 0x18, 0x00, false, false, false, 0, 0, 0, 0 };
+SensorHealth bmeHealth = { "BME280",  0x76, 0x77, false, false, false, 0, 0, 0, 0 };
 
-// GPS power management -- sleep/wake cycle to reduce average current draw.
-// The ATGM336H draws ~25-30mA continuously; duty-cycling it to 30s active
-// every 10 minutes drops its average contribution to ~1-2mA.
-// Sleep command: $PMTK161,0*28 (confirmed checksum, standard MTK protocol)
-// Wake: any byte sent over UART after >=120ms of sleep
-enum GpsState { GPS_AWAKE, GPS_SLEEPING };
-GpsState gpsState        = GPS_AWAKE;
-unsigned long gpsStateMs = 0;          // millis() when we entered the current state
-bool gpsFixThisWindow    = false;      // fresh fix seen since the current wake?
-const unsigned long GPS_AWAKE_MS     = 30000;  // minimum awake time per cycle
-const unsigned long GPS_AWAKE_MAX_MS = 90000;  // hard cap if no fix arrives --
-                                               // a dead antenna can't pin the GPS on forever
-const unsigned long GPS_SLEEP_MS     = 600000; // 10 minutes asleep
+// How often a still-broken sensor re-announces itself, counted in failed
+// attempts. At a 30s read interval, 20 attempts is roughly every 10 minutes:
+// often enough that a dead sensor is obvious in a log you scroll into hours
+// later, rare enough that it doesn't drown the console.
+const uint32_t FAULT_REPEAT_EVERY = 20;
 
-void gpsSetSleep() {
-  gpsSerial.print("$PMTK161,0*28\r\n");
-  gpsSerial.flush(); // ensure bytes transmit before we stop checking
-  gpsState  = GPS_SLEEPING;
-  gpsStateMs = millis();
-  Serial.println("GPS sleeping (10 min).");
+// Minimum gap between printed lines for a single sensor. This exists for the
+// marginal-connection case: a sensor that fails and recovers on alternating
+// cycles would otherwise cost a multi-line FAILED block plus a RECOVERED line
+// every cycle -- noisier than the naive per-cycle logging this replaced.
+// The first-ever report for a sensor bypasses this, so a device that is
+// missing at boot is announced immediately rather than ten minutes later.
+const unsigned long FAULT_MIN_GAP_MS = 60000;
+
+// Decode Wire.endTransmission()'s return code. This is the difference between
+// "nothing is answering at that address" and "the bus itself is jammed" --
+// two very different wiring faults that both surface as begin() returning
+// false and nothing else.
+const char* i2cErrorText(uint8_t code) {
+  switch (code) {
+    case 0: return "ok";
+    case 1: return "data too long for buffer";
+    case 2: return "NACK on address -- nothing is responding here";
+    case 3: return "NACK on data -- device answered, then stopped";
+    case 4: return "bus error -- check SDA/SCL wiring and pull-ups";
+    case 5: return "timeout -- bus held low by a wedged device or a short";
+    default: return "unrecognised error code";
+  }
 }
 
-void gpsWake() {
-  // Any byte wakes the module; must wait >=120ms after sleep before sending.
-  // We've been sleeping for 10 minutes so the 120ms constraint is long past.
-  gpsSerial.print("\r\n");
-  gpsState  = GPS_AWAKE;
-  gpsStateMs = millis();
-  gpsFixThisWindow = false;
-  Serial.println("GPS waking for fix...");
+// Probe one address without transferring data. Returns the endTransmission code.
+uint8_t i2cProbe(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission();
+}
+
+// Full bus scan. Cheap (127 probes, a few ms) and it turns "sensor not found"
+// into "here is exactly what IS on the bus", which separates a wrong address
+// from a dead bus from a power fault at a glance.
+void i2cScan() {
+  Serial.println("[I2C] scanning bus...");
+  int found = 0;
+  for (uint8_t a = 1; a < 127; a++) {
+    if (i2cProbe(a) == 0) {
+      const char *known = "";
+      if      (a == 0x18)               known = "   <- MCP9808 (temperature)";
+      else if (a == 0x76 || a == 0x77)  known = "   <- BME280 (humidity/pressure)";
+      Serial.printf("[I2C]   found 0x%02X%s\n", a, known);
+      found++;
+    }
+  }
+  if (found == 0) {
+    Serial.println("[I2C]   NO DEVICES FOUND.");
+    Serial.println("[I2C]   Check SDA=D4, SCL=D5, both sensors on 3V3 and GND,");
+    Serial.println("[I2C]   and that at least one board provides bus pull-ups.");
+  } else {
+    Serial.printf("[I2C] scan complete -- %d device(s) present.\n", found);
+  }
+}
+
+// Record the outcome of a read or init attempt and decide whether it is worth
+// a line of Serial output. Call it on EVERY attempt, success or failure --
+// it does the filtering.
+void sensorReport(SensorHealth &h, bool nowOk, const char *detail) {
+  unsigned long now = millis();
+
+  if (nowOk) {
+    if (!h.ok) {  // transition into working
+      if (h.failureAnnounced) {
+        Serial.printf("[SENSOR] %s RECOVERED after %lu consecutive failure(s).\n",
+                      h.name, (unsigned long)h.consecFails);
+        h.lastReportMs     = now;
+        h.failureAnnounced = false;
+      } else if (!h.everOk) {
+        Serial.printf("[SENSOR] %s online.\n", h.name);
+        h.lastReportMs = now;
+      }
+      // If the matching failure was rate-limited away, stay quiet about the
+      // recovery too -- printing half of each flap is just noise.
+    }
+    h.ok          = true;
+    h.everOk      = true;
+    h.consecFails = 0;
+    h.lastGoodMs  = now;
+    return;
+  }
+
+  h.consecFails++;
+  h.totalFails++;
+
+  bool startOfOutage = (h.consecFails == 1);
+  bool periodicDue   = (h.consecFails % FAULT_REPEAT_EVERY) == 0;
+  bool everPrinted   = (h.lastReportMs != 0);
+  bool tooSoon       = everPrinted && (now - h.lastReportMs) < FAULT_MIN_GAP_MS;
+
+  // startOfOutage rather than "was previously ok": at boot h.ok is already
+  // false, so keying off the transition alone would make a sensor that is
+  // simply not plugged in fail completely silently.
+  if ((startOfOutage || periodicDue) && !tooSoon) {
+    Serial.printf("[SENSOR] %s FAILED (%lu consecutive, %lu total): %s\n",
+                  h.name, (unsigned long)h.consecFails, (unsigned long)h.totalFails,
+                  detail ? detail : "no detail given");
+
+    // The multi-line diagnostic block is reserved for the two cases where it
+    // earns its space: the first failure since boot (you are debugging wiring)
+    // and the periodic re-announce during a sustained outage. Emitting it on
+    // every transition made a sensor with a marginal connection noisier than
+    // the naive per-cycle logging this replaced. It also means the I2C bus
+    // isn't probed on every flap, which matters when the bus is the fault.
+    if (h.totalFails == 1 || periodicDue) {
+      if (h.everOk && h.lastGoodMs) {
+        Serial.printf("[SENSOR]   last good reading was %lus ago.\n",
+                      (unsigned long)((now - h.lastGoodMs) / 1000UL));
+      }
+      Serial.printf("[SENSOR]   I2C 0x%02X -> %s\n", h.addr, i2cErrorText(i2cProbe(h.addr)));
+      if (h.addrAlt) {
+        Serial.printf("[SENSOR]   I2C 0x%02X -> %s\n", h.addrAlt, i2cErrorText(i2cProbe(h.addrAlt)));
+      }
+    }
+    h.lastReportMs     = now;
+    h.failureAnnounced = true;
+  }
+  h.ok = false;
 }
 
 // ---- Async server + WebSocket ----
@@ -125,8 +273,12 @@ DNSServer dnsServer;
 bool runningAsAP = false;
 
 // ---- Timers ----
+// 30s rather than the GPS build's 10s: fewer WebSocket pushes means less
+// radio airtime, and a seven-segment weather display gains nothing from
+// 10-second granularity. This is also the cadence the history mean is
+// accumulated at (see loop()).
 unsigned long lastSensorRead = 0;
-const unsigned long SENSOR_INTERVAL_MS = 10000;   // 10 seconds
+const unsigned long SENSOR_INTERVAL_MS = 30000;   // 30 seconds
 
 // ---- WiFi watchdog ----
 // The connection is only established once in setup(); without this, a
@@ -146,21 +298,13 @@ unsigned long wifiDownSince = 0; // 0 = link currently up
 const float TEMP_OFFSET_F = 0.0f;
 
 // ---- Live data ----
+// lastPressureHPa is RAW STATION PRESSURE. There is deliberately no altitude
+// variable here any more: the sea-level correction needs an elevation, that
+// elevation now comes from the ZIP code lookup in the browser, so the
+// correction is applied browser-side in web_pages.h. See the file header.
 float lastHumidity    = 0.0;
 float lastTempF       = 0.0;
 float lastPressureHPa = 0.0;
-float lastAltitudeM   = 0.0; // last known GPS altitude in metres; 0 = sea level fallback before first fix
-
-// Latched GPS position/date -- captured while the GPS is awake with a fresh
-// fix, then reused while it sleeps. For a stationary station the position
-// doesn't change between wake cycles, so the page keeps showing valid data
-// (pin, grid square, sunrise/sunset, date) instead of blanking to "--" for
-// the 10 minutes the GPS radio is off. The date can be up to one sleep
-// cycle stale across UTC midnight; the next wake refreshes it.
-bool     gpsEverFixed = false;
-double   lastLat = 0.0, lastLon = 0.0;
-uint16_t lastGpsYear = 0;
-uint8_t  lastGpsMon = 0, lastGpsDay = 0;
 
 // ---- Intra-day temperature history (LittleFS, 7-day rolling) ----
 // One MCP9808 sample every HISTORY_INTERVAL_MS, stored as {epoch, meanTempF}
@@ -191,7 +335,7 @@ unsigned long lastHistWrite = 0;   // millis() of the last flush to flash
 struct __attribute__((packed)) IndoorReport {
   float    tempF;
   float    humidity;
-  float    pressureHPa;  // raw station pressure; SLP correction applied here
+  float    pressureHPa;  // raw station pressure; forwarded raw, corrected in the browser
   uint32_t seq;
 };
 // Compile-time guarantee that the packed layout is exactly what the radio
@@ -210,6 +354,14 @@ IndoorReport  indoorLast = {};
 bool          indoorEverReceived = false;
 unsigned long indoorLastMs = 0;
 uint32_t      indoorLastPrintedSeq = 0; // loop()-side only, no lock needed
+bool          indoorWasStale = false;   // loop()-side edge detector for link-lost logging
+
+// Periodic one-line summary of every subsystem, so a console you scroll into
+// hours later tells you the current state without needing to catch a
+// transition. 10 minutes is frequent enough to be useful, rare enough to stay
+// out of the way.
+const unsigned long HEALTH_REPORT_MS = 600000;
+unsigned long lastHealthReport = 0;
 
 // If no report arrives for 3 minutes (three missed 1-minute cycles), the
 // page shows the indoor panel as stale ("--") rather than silently
@@ -245,9 +397,10 @@ const char *NTP_SERVER_2 = "time.nist.gov";
 // Pacific Northwest: America/Los_Angeles. POSIX TZ string handles PST/PDT DST automatically.
 const char *TZ_STRING = "PST8PDT,M3.2.0,M11.1.0";
 
-// Returns true and fills `outEpoch` with a valid Unix time if NTP or GPS
-// has synced the clock. Falls back to millis()-since-boot and returns false
-// so callers can flag data as unsynced.
+// Returns true and fills `outEpoch` with a valid Unix time if NTP has synced
+// the clock. Falls back to millis()-since-boot and returns false so callers
+// can flag data as unsynced. NTP is the only time source in this build, so
+// this returns false for the whole session in AP-fallback mode.
 bool getEpochSeconds(uint32_t &outEpoch) {
   time_t now;
   time(&now);
@@ -260,53 +413,12 @@ bool getEpochSeconds(uint32_t &outEpoch) {
   return false;
 }
 
-// Apply a validated GPS time to the ESP32 system clock.
-// Called from loop() whenever TinyGPS++ reports a fresh, valid date+time.
-// GPS time is always UTC. The existing TZ string on the system clock handles
-// local-time offset automatically, same as NTP.
-bool applyGpsTime(TinyGPSDate &d, TinyGPSTime &t) {
-  if (!d.isValid() || !t.isValid()) return false;
-
-  // Convert GPS date+time (UTC) to a Unix epoch (seconds since 1970-01-01 UTC).
-  // We can't rely on timegm() being available in all arduino-esp32 newlib
-  // versions (it's a POSIX extension that some builds omit), so compute the
-  // epoch directly using the standard day-counting formula instead.
-  int y = d.year();
-  int m = d.month();
-  int day_val = d.day();
-
-  // Shift months so March=1, making leap-day fall at end of year (simplifies math)
-  if (m <= 2) { y--; m += 12; }
-  long days = 365L*y + y/4 - y/100 + y/400   // days from year 0 to year y
-            + (153*m + 8) / 5                  // days from March 1 to month m
-            + day_val
-            - 719562;                           // offset to 1970-01-01 epoch (verified)
-
-  time_t epoch = (time_t)(days * 86400L
-                          + t.hour()   * 3600L
-                          + t.minute() * 60L
-                          + t.second());
-
-  if (epoch < 1704067200L) return false; // sanity: reject anything before 2024-01-01
-
-  struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
-  int result = settimeofday(&tv, nullptr);
-  if (result == 0) {
-    Serial.printf("GPS time set: %04d-%02d-%02d %02d:%02d:%02d UTC (epoch %ld)\n",
-                  d.year(), d.month(), d.day(),
-                  t.hour(), t.minute(), t.second(), (long)epoch);
-  }
-  return (result == 0);
-}
-
-// How often to re-apply GPS time to the system clock (seconds).
-// Once per minute is more than precise enough for this application and
-// avoids any risk of flooding settimeofday() calls if the GPS is continuously
-// outputting valid fixes. Only sets time when GPS reports a fresh fix
-// (age < 1500ms per TinyGPS++ convention).
-const unsigned long GPS_SYNC_INTERVAL_MS = 60000;
-unsigned long lastGpsSync = 0;
-
+// NOTE: the GPS build carried an applyGpsTime() here that converted a
+// TinyGPS++ date/time into a Unix epoch by hand (timegm() isn't reliably
+// available in arduino-esp32's newlib) and pushed it via settimeofday().
+// With the GPS gone there is nothing to feed it, so it was removed along
+// with its sync-interval throttle. configTzTime() in setup() is now the
+// only thing that ever sets the clock.
 
 // The HTML page (index_html) lives in web_pages.h -- see that file
 // for why it was moved out of this .ino (Arduino IDE ctags bug).
@@ -340,7 +452,12 @@ void onWsEvent(AsyncWebSocket *server,
 void historyAppend(uint32_t epoch, float tF) {
   if (!littleFsOk) return;
   File f = LittleFS.open(HISTORY_PATH, "r+");
-  if (!f) return;
+  if (!f) {
+    // Previously a silent return -- a full or failing flash would quietly
+    // stop recording history with nothing in the log to explain the gap.
+    Serial.printf("[HIST] ERROR: cannot open %s for writing. This sample is lost.\n", HISTORY_PATH);
+    return;
+  }
   uint32_t oldestEpoch = 0xFFFFFFFFUL;
   int      oldestSlot  = 0;
   for (int i = 0; i < HISTORY_CAPACITY; i++) {
@@ -354,8 +471,12 @@ void historyAppend(uint32_t epoch, float tF) {
   }
   TempSample rec = { epoch, tF };
   f.seek((uint32_t)oldestSlot * sizeof(TempSample), SeekSet);
-  f.write((const uint8_t*)&rec, sizeof(rec));
+  size_t wrote = f.write((const uint8_t*)&rec, sizeof(rec));
   f.close();
+  if (wrote != sizeof(rec)) {
+    Serial.printf("[HIST] ERROR: short write (%u of %u bytes) into slot %d -- flash full or failing.\n",
+                  (unsigned)wrote, (unsigned)sizeof(rec), oldestSlot);
+  }
 }
 
 // Serialize the stored samples to JSON: {"unit":"F","interval_s":900,
@@ -412,10 +533,13 @@ void pushSensorData() {
   uint32_t epoch;
   bool synced = getEpochSeconds(epoch);
 
-  StaticJsonDocument<448> doc; // bumped from 320 for the indoor object
+  // 256 is comfortable for 5 top-level members + the 4-member "in" object.
+  // (Was 448 in the GPS build, which also had to carry a 6-member "gps"
+  // object; that object is gone, so this shrank with it.)
+  StaticJsonDocument<256> doc;
   doc["h"]    = lastHumidity;
   doc["t"]    = lastTempF;
-  doc["p"]    = lastPressureHPa;
+  doc["p"]    = lastPressureHPa; // RAW station pressure -- page applies SLP correction
   doc["ts"]   = epoch;
   doc["sync"] = synced ? 1 : 0;
 
@@ -431,34 +555,14 @@ void pushSensorData() {
   JsonObject inObj = doc.createNestedObject("in");
   inObj["ok"] = indoorOk ? 1 : 0;
   if (indoorOk) {
-    // Sea-level correction for the indoor barometer. The correction models
-    // the OUTDOOR air column between our altitude and sea level, so it uses
-    // the outdoor (MCP9808) temperature -- the indoor thermostat setting
-    // says nothing about the atmosphere outside. Falls back to the indoor
-    // temperature only if the outdoor sensor is down. Both sensors share
-    // the base's GPS altitude (same site).
-    float colTempC = mcpOk ? (lastTempF - 32.0f) * 5.0f / 9.0f
-                           : (indoorCopy.tempF - 32.0f) * 5.0f / 9.0f;
-    float inSlp = indoorCopy.pressureHPa *
-                  powf(1.0f + (0.0065f * lastAltitudeM) / (colTempC + 273.15f), 5.2561f);
+    // Forwarded raw, exactly as the satellite measured it. The sea-level
+    // correction that used to happen here needed an altitude, which the GPS
+    // supplied; it now happens in the browser using the ZIP's elevation.
+    // The page uses the OUTDOOR temperature for that correction (the air
+    // column being modelled is outside), which it already has.
     inObj["t"] = indoorCopy.tempF;
     inObj["h"] = indoorCopy.humidity;
-    inObj["p"] = inSlp;
-  }
-
-  // GPS: report the latched position/date once any fix has ever been
-  // acquired. The values are refreshed each wake cycle; between cycles
-  // (GPS sleeping) they're stale by at most GPS_SLEEP_MS, which is fine
-  // for a stationary station -- far better than blanking the page's GPS
-  // data to "--" for 9.5 of every 10 minutes.
-  JsonObject gpsObj = doc.createNestedObject("gps");
-  gpsObj["fix"] = gpsEverFixed ? 1 : 0;
-  if (gpsEverFixed) {
-    gpsObj["lat"]  = lastLat;
-    gpsObj["lon"]  = lastLon;
-    gpsObj["year"] = lastGpsYear;
-    gpsObj["mon"]  = lastGpsMon;
-    gpsObj["day"]  = lastGpsDay;
+    inObj["p"] = indoorCopy.pressureHPa;
   }
 
   String json;
@@ -471,9 +575,32 @@ void pushSensorData() {
 // ------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  Serial.setTxTimeoutMs(0); // prevent USB CDC blocking from starving UART1 (GPS)
-                             // confirmed fix for ESP32-C6 USB CDC vs HardwareSerial conflict
-  delay(300);
+  // Non-blocking USB CDC writes. In the GPS build this existed to stop CDC
+  // backpressure from starving UART1; there's no UART1 any more, but keep it:
+  // without it, Serial.printf() blocks for seconds when the USB port is
+  // enumerated but nothing is reading it, which stalls loop() and the
+  // WebSocket pushes with it.
+  Serial.setTxTimeoutMs(0);
+  delay(300); // keep this -- it's the window that makes a bad build interruptible
+
+  // --- CPU frequency: power ---
+  // 80MHz is the floor with WiFi active (the radio will not run below it) and
+  // saves roughly 15-25mA versus the 160MHz default. Safe for USB Serial/JTAG
+  // on the C6, so firmware updates over USB are unaffected. Do NOT go lower
+  // while WiFi is up, and do NOT reach for deep/light sleep on this node --
+  // it serves an always-on page and must keep the USB port enumerated.
+  //
+  // Set BEFORE any WiFi call, which is why it sits this early in setup().
+  //
+  // DEBUG HANDLE: if you ever see a crash inside the WiFi driver -- ppTask,
+  // wifi_deinit, wDev_Rxbuf_Deinit, or a "CORRUPT HEAP" assert from
+  // multi_heap_poisoning -- put this back to 160 as the FIRST thing you try.
+  // 80MHz is a supported WiFi clock, but it halves the headroom of the WiFi
+  // protocol task, and the heap corruption fixed in the WiFi block below
+  // lived in precisely that task. Ruling the clock out takes one edit.
+  const uint32_t CPU_FREQ_MHZ = 80;
+  setCpuFrequencyMhz(CPU_FREQ_MHZ);
+  Serial.printf("CPU frequency: %uMHz\n", getCpuFrequencyMhz());
 
   // --- Turn off the onboard yellow LED ---
   // XIAO ESP32-C6's built-in LED is on GPIO15 and is ACTIVE-LOW (the pin
@@ -499,6 +626,11 @@ void setup() {
   // check your console; if it reports much more than ~50-1000ms, consider
   // updating your arduino-esp32 core version.
   Serial.printf("I2C bus timeout: %ums\n", Wire.getTimeOut());
+
+  // Enumerate the bus before touching either sensor. If a begin() fails
+  // below, this scan is what tells you whether the device is absent, at an
+  // unexpected address, or the whole bus is down.
+  i2cScan();
 
   // --- LittleFS: persistent store for the temperature history (/temps.bin) ---
   // format-on-fail (true) so a blank or corrupt flash comes up usable instead
@@ -540,9 +672,11 @@ void setup() {
   }
   if (bmeOk) {
     configureBme();
-    Serial.println("BME280 found and initialized (humidity + pressure, forced/weather mode).");
+    sensorReport(bmeHealth, true, nullptr);
+    Serial.println("[SENSOR]   humidity + pressure, forced/weather mode.");
   } else {
-    Serial.println("WARNING: BME280 not found at 0x76 or 0x77 -- check wiring. Will keep retrying in loop().");
+    sensorReport(bmeHealth, false, "begin() failed at both 0x76 and 0x77");
+    Serial.println("[SENSOR]   will keep retrying every read cycle -- no reboot needed.");
   }
 
   // MCP9808 -- precision temperature sensor, I2C address 0x18 (default,
@@ -550,29 +684,39 @@ void setup() {
   // your breakout, update the address here accordingly.
   mcpOk = mcp.begin(0x18);
   if (mcpOk) {
-    mcp.setResolution(3); // max resolution: 0.0625°C / read time ~250ms -- fine at 10s interval
-    Serial.println("MCP9808 found and initialized (temperature).");
+    mcp.setResolution(3); // max resolution: 0.0625°C / read time ~250ms -- fine at a 30s interval
+    sensorReport(mcpHealth, true, nullptr);
+    Serial.println("[SENSOR]   temperature, resolution 3 (0.0625C).");
   } else {
-    Serial.println("WARNING: MCP9808 not found at 0x18 -- check wiring. Will keep retrying in loop().");
+    sensorReport(mcpHealth, false, "begin() failed at 0x18");
+    Serial.println("[SENSOR]   if your breakout has address pins strapped, update the address here.");
   }
 
-  // ATGM336H GPS on UART1: D6 (GPIO16) = ESP32 TX -> GPS RX,
-  //                         D7 (GPIO17) = ESP32 RX <- GPS TX
-  // Default baud rate for this module is 9600 -- confirmed from datasheet
-  // and multiple independent sources. RX pin is listed first in begin().
-  gpsSerial.setRxBufferSize(512);             // must be called before begin(); default 256 can overflow during WiFi bursts
-  gpsSerial.begin(9600, SERIAL_8N1, D7, D6); // (baud, config, RX_pin, TX_pin)
-  gpsStateMs = millis();                      // start the first awake window from boot
-  Serial.println("GPS serial started (UART1, 9600 baud). First awake window: 30s.");
-  // Note: GPS takes time to acquire its first fix (typically 30-90 seconds
-  // outdoors with clear sky view; much longer indoors). The device will
-  // operate normally from the start -- GPS time sync simply won't happen
-  // until a fix is acquired, at which point it sets the clock automatically.
+  // (No GPS UART in this build. D6/D7 and UART1 are unused and left
+  // uninitialised -- nothing should be wired to them.)
 
   // --- WiFi: try the home network, fall back to our own AP if it's not available ---
   // 3 attempts (~15s each, ~45s worst case) before giving up on STA and
   // broadcasting our own network instead. If STA succeeds on any attempt,
   // AP/DNS never start at all -- behavior is identical to before.
+  //
+  // IMPORTANT -- do not "clean up" the disconnect calls below back into
+  // WiFi.disconnect(true). The bool argument is `wifioff`: passing true stops
+  // and tears the WiFi driver down, and doing that once per failed attempt
+  // drove a heap corruption inside the driver's own deinit path:
+  //
+  //   ppTask -> ieee80211_ioctl_process -> wifi_deinit -> ic_deinit
+  //          -> wDev_Rxbuf_Deinit -> esp_timer_delete -> multi_heap_free
+  //          -> verify_allocated_region -> assert -> panic_abort
+  //
+  //   CORRUPT HEAP: Bad tail at 0x408317bc. Expected 0xbaad5678 got 0xc034e7ec
+  //   assert failed: multi_heap_free multi_heap_poisoning.c:279 (head != NULL)
+  //
+  // It only reproduces on a boot where the home network is unreachable, since
+  // that is the only path that repeatedly deinits the radio. A plain
+  // disconnect just drops the association and leaves the driver initialised,
+  // which is all the retry loop actually needs.
+  WiFi.persistent(false); // don't rewrite credentials to NVS on every begin()
   WiFi.mode(WIFI_STA);
   const int WIFI_MAX_ATTEMPTS = 3;
   const uint32_t WIFI_ATTEMPT_TIMEOUT_MS = 15000;
@@ -589,8 +733,8 @@ void setup() {
     staConnected = (WiFi.status() == WL_CONNECTED);
     if (!staConnected) {
       Serial.println(" failed.");
-      WiFi.disconnect(true); // clean slate before the next attempt
-      delay(300);
+      WiFi.disconnect(false); // drop the association only -- see the note above
+      delay(500);             // let the driver settle before re-associating
     }
   }
 
@@ -603,7 +747,10 @@ void setup() {
     WiFi.setAutoReconnect(true);
   } else {
     Serial.println("\nCouldn't join home WiFi after 3 attempts -- starting fallback AP instead.");
-    WiFi.disconnect(true);
+    // Again: no wifioff. WiFi.mode() performs the STA->AP switch itself, and
+    // it does so without the full driver teardown that was corrupting the heap.
+    WiFi.disconnect(false);
+    delay(200);
     WiFi.mode(WIFI_AP);
     bool apOk = WiFi.softAP(FALLBACK_AP_SSID, FALLBACK_AP_PASSWORD);
     if (apOk) {
@@ -665,6 +812,30 @@ void setup() {
   // Auth as "/" -- otherwise the readings would leak around the login.
   server.on("/history", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(200, "application/json", historyToJson());
+  }).setAuthentication(WEB_USER, WEB_PASS);
+
+  // --- /config: hands the AccuWeather API key to the page ---
+  // The forecast is fetched by the BROWSER, so the key has to reach the
+  // JavaScript somehow. Serving it from here keeps it in secrets.h (which is
+  // gitignored) instead of hardcoding it into web_pages.h (which is
+  // committed) -- that is the whole point of this endpoint.
+  //
+  // Be clear about what this does and does not buy you: the key stays out of
+  // git, but anyone who can log into the page can read it, either from this
+  // response or from the browser's network tab. That is inherent to
+  // browser-side fetching of a keyed API, not a flaw in this handler. The
+  // key is rate-limited (50 calls/day free tier) and grants nothing except
+  // weather lookups, so the exposure is bounded -- but rotate it if the page
+  // password ever leaks.
+  //
+  // Auth is per-handler on this server, not global. Forgetting the
+  // .setAuthentication() below would publish the key to anyone on the LAN.
+  // AccuWeather keys are alphanumeric, so no JSON escaping is needed.
+  server.on("/config", HTTP_GET, [](AsyncWebServerRequest *request){
+    String cfg = "{\"awkey\":\"";
+    cfg += ACCUWEATHER_API_KEY;
+    cfg += "\"}";
+    request->send(200, "application/json", cfg);
   }).setAuthentication(WEB_USER, WEB_PASS);
 
   // In fallback AP mode, redirect any unrecognized request to "/" -- this is
@@ -748,81 +919,55 @@ void loop() {
     }
   }
 
-  // GPS sleep/wake state machine.
-  // When awake: feed bytes to TinyGPS++ and apply time sync as before.
-  // When sleeping: drain the UART buffer (discarding bytes) so it doesn't
-  // back up, and flip to awake after 10 minutes.
-  if (gpsState == GPS_AWAKE) {
-    while (gpsSerial.available() > 0) {
-      gps.encode(gpsSerial.read());
-    }
-    // Apply GPS time sync while awake and fix is fresh
-    if (gps.date.isValid() && gps.time.isValid() &&
-        gps.date.age() < 1500 && gps.time.age() < 1500 &&
-        now - lastGpsSync >= GPS_SYNC_INTERVAL_MS) {
-      if (applyGpsTime(gps.date, gps.time)) {
-        lastGpsSync = now;
-      }
-    }
-    // Latch position, altitude, and date whenever we have a fresh fix --
-    // these persist across sleep cycles so the page keeps valid data while
-    // the GPS radio is off.
-    if (gps.location.isValid() && gps.location.age() < 5000) {
-      lastLat = gps.location.lat();
-      lastLon = gps.location.lng();
-      // Altitude is the noisiest GPS output -- poor satellite geometry can
-      // put it off by tens of metres, which skews the pressure correction.
-      // Only update the stored altitude when fix quality is good (HDOP < 2),
-      // otherwise keep the previous good value (latch, don't zero). The
-      // isValid() guard matters: hdop() reads 0.0 before the first
-      // HDOP-bearing sentence arrives, which would sneak past the < 2 check.
-      if (gps.altitude.isValid() && gps.hdop.isValid() && gps.hdop.hdop() < 2.0) {
-        lastAltitudeM = (float)gps.altitude.meters();
-      }
-      if (gps.date.isValid()) {
-        lastGpsYear = gps.date.year();
-        lastGpsMon  = gps.date.month();
-        lastGpsDay  = gps.date.day();
-      }
-      gpsEverFixed     = true;
-      gpsFixThisWindow = true;
-    }
-    // Adaptive sleep decision: sleep once we've been awake the minimum
-    // 30s AND actually seen a fresh fix this window -- or at the 90s hard
-    // cap regardless, so poor reception extends the window (hot-start
-    // reacquisition occasionally exceeds 30s) but a dead antenna can't
-    // keep the GPS powered forever.
-    unsigned long awakeFor = now - gpsStateMs;
-    if ((awakeFor >= GPS_AWAKE_MS && gpsFixThisWindow) ||
-        awakeFor >= GPS_AWAKE_MAX_MS) {
-      gpsSetSleep();
-    }
-  } else { // GPS_SLEEPING
-    // Drain any stray bytes without parsing them
-    while (gpsSerial.available() > 0) gpsSerial.read();
-    // Wake up after GPS_SLEEP_MS
-    if (now - gpsStateMs >= GPS_SLEEP_MS) {
-      gpsWake();
-    }
-  }
   if (now - lastSensorRead >= SENSOR_INTERVAL_MS) {
     lastSensorRead = now;
 
     // Temperature from MCP9808 (primary, high-precision sensor).
+    // A sensor that falls off the bus mid-session does NOT make begin() fail
+    // again -- mcpOk stays true and readTempF() just starts returning NaN. So
+    // validate every reading, not just the init. Without this, NaN flows into
+    // the WebSocket JSON and the page's digit renderer (which does
+    // Number(NaN).toFixed() then indexes a segment map) breaks on it.
     if (mcpOk) {
-      lastTempF = mcp.readTempF() + TEMP_OFFSET_F;
+      float tF = mcp.readTempF();
+      if (isnan(tF)) {
+        sensorReport(mcpHealth, false, "read returned NaN -- sensor stopped responding");
+        mcpOk = false;
+      } else if (tF < -40.0f || tF > 257.0f) {
+        // The MCP9808's own spec is -40..+125C (-40..257F). Outside that is a
+        // fault word or a garbled transfer, not weather.
+        char why[80];
+        snprintf(why, sizeof(why), "reading %.1fF is outside the sensor's -40..257F range", tF);
+        sensorReport(mcpHealth, false, why);
+        mcpOk = false;
+      } else {
+        lastTempF = tF + TEMP_OFFSET_F;
+        sensorReport(mcpHealth, true, nullptr);
+      }
+      // Note: on failure lastTempF keeps its last good value rather than being
+      // zeroed. The [READ] line below prints "--" so the log doesn't imply the
+      // stale number is live.
     } else {
-      Serial.println("MCP9808 not initialized -- skipping temp read, retrying begin()");
+      // Retry begin() so a sensor connected or reseated after boot recovers
+      // without a reboot.
       mcpOk = mcp.begin(0x18);
-      if (mcpOk) mcp.setResolution(3); // match the boot path so a recovered sensor runs at full resolution
+      if (mcpOk) {
+        mcp.setResolution(3); // match the boot path so a recovered sensor runs at full resolution
+        sensorReport(mcpHealth, true, nullptr);
+      } else {
+        sensorReport(mcpHealth, false, "begin() retry failed -- device not responding");
+      }
     }
 
     // --- Intra-day temperature history ---
-    // Fold this 10s reading into the current interval's running mean, and
+    // Fold this 30s reading into the current interval's running mean, and
     // flush that mean to flash every HISTORY_INTERVAL_MS. Gated on a *synced*
     // clock: an unsynced timestamp (relative millis) would file the sample
-    // under the wrong day, so we simply don't record until GPS/NTP has set
-    // real time. Reuses the existing sensor cadence -- no extra timer.
+    // under the wrong day, so we simply don't record until NTP has set real
+    // time. Reuses the existing sensor cadence -- no extra timer.
+    // NOTE: NTP is the only clock source in this build, so in AP-fallback
+    // mode this gate never opens and no history is recorded. That is a known
+    // and accepted consequence of dropping the GPS.
     if (littleFsOk && mcpOk) {
       uint32_t epochNow;
       if (getEpochSeconds(epochNow)) {
@@ -837,35 +982,61 @@ void loop() {
       }
     }
 
-    // Humidity + pressure from BME280.
+    // Humidity + pressure from BME280. Same silent-failure mode as the
+    // MCP9808: the library keeps reporting success while the chip returns NaN.
     if (bmeOk) {
       // Forced mode: the sensor idles until we explicitly trigger one
       // conversion. Blocks ~10ms at 1x oversampling -- negligible at a
-      // 10-second read interval.
+      // 30-second read interval.
       bme.takeForcedMeasurement();
-      lastHumidity     = bme.readHumidity();
-      // Station pressure in hPa, then reduce to sea-level pressure using the
-      // ICAO standard barometric formula:
+      float hum  = bme.readHumidity();
+      // RAW station pressure -- no sea-level reduction here. The ICAO
+      // correction needs a station altitude, which used to come from the GPS
+      // and now comes from the ZIP code's elevation, which only the browser
+      // knows. web_pages.h applies:
       //   SLP = P_station * (1 + (0.0065 * alt_m) / T_K) ^ 5.2561
-      // Uses GPS altitude (metres) and MCP9808 temperature (°C) for accuracy.
-      // lastAltitudeM is 0 before the first GPS fix, giving no correction
-      // (safe fallback -- better than applying a wrong correction).
-      float stationHPa = bme.readPressure() / 100.0f;
-      // lastTempF is already the calibrated true temperature (offset applied
-      // at read time), so convert it to °C directly. Do NOT subtract the
-      // offset back out here -- that would feed the *uncalibrated* sensor
-      // reading into the pressure correction.
-      float tempC      = (lastTempF - 32.0f) * 5.0f / 9.0f;
-      float T_K        = tempC + 273.15f;
-      lastPressureHPa  = stationHPa * powf(1.0f + (0.0065f * lastAltitudeM) / T_K, 5.2561f);
+      // If you ever re-add the correction here, remove it there too.
+      float hpa = bme.readPressure() / 100.0f;
 
-      Serial.printf("TempF: %.2f (MCP9808)  Humidity: %.1f  SLP: %.1f hPa (alt %.0fm)  GPS sats: %lu\n",
-                    lastTempF, lastHumidity, lastPressureHPa, lastAltitudeM,
-                    gps.satellites.value());
+      if (isnan(hum) || isnan(hpa)) {
+        sensorReport(bmeHealth, false, "read returned NaN -- sensor stopped responding");
+        bmeOk = false;
+      } else if (hum < 0.0f || hum > 100.0f) {
+        char why[80];
+        snprintf(why, sizeof(why), "humidity %.1f%% is outside 0-100%%", hum);
+        sensorReport(bmeHealth, false, why);
+        bmeOk = false;
+      } else if (hpa < 300.0f || hpa > 1100.0f) {
+        // Deliberately wide: 300-1100 hPa spans a hurricane at sea level to
+        // the summit of Everest, so this only trips on genuinely broken data.
+        char why[88];
+        snprintf(why, sizeof(why), "pressure %.1f hPa is outside the plausible 300-1100 hPa", hpa);
+        sensorReport(bmeHealth, false, why);
+        bmeOk = false;
+      } else {
+        lastHumidity    = hum;
+        lastPressureHPa = hpa;
+        sensorReport(bmeHealth, true, nullptr);
+      }
     } else {
-      Serial.println("BME280 not initialized -- skipping humidity/pressure read, retrying begin()");
       bmeOk = bme.begin(0x76) || bme.begin(0x77);
-      if (bmeOk) configureBme(); // match the boot path on recovery
+      if (bmeOk) {
+        configureBme(); // match the boot path on recovery
+        sensorReport(bmeHealth, true, nullptr);
+      } else {
+        sensorReport(bmeHealth, false, "begin() retry failed at both 0x76 and 0x77");
+      }
+    }
+
+    // One consolidated reading line. A sensor that is currently faulted prints
+    // "--" rather than its last good value, so nothing in the log looks live
+    // when it isn't.
+    {
+      char tBuf[16], hBuf[16], pBuf[20];
+      if (mcpHealth.ok) snprintf(tBuf, sizeof(tBuf), "%.2fF", lastTempF);       else strcpy(tBuf, "--");
+      if (bmeHealth.ok) snprintf(hBuf, sizeof(hBuf), "%.1f%%", lastHumidity);   else strcpy(hBuf, "--");
+      if (bmeHealth.ok) snprintf(pBuf, sizeof(pBuf), "%.1f hPa", lastPressureHPa); else strcpy(pBuf, "--");
+      Serial.printf("[READ] temp %s | humidity %s | station pressure %s\n", tBuf, hBuf, pBuf);
     }
 
     // Push to WebSocket clients as long as at least one sensor gave us data.
@@ -883,16 +1054,66 @@ void loop() {
     bool          inRcvd;
     unsigned long inMs;
     snapshotIndoor(inCopy, inRcvd, inMs);
+
     if (inRcvd && inCopy.seq != indoorLastPrintedSeq) {
+      // The satellite's sequence counter lives in RTC memory, which survives
+      // deep sleep but not power loss -- so a counter that jumps BACKWARDS
+      // means the node rebooted, and a forward jump means reports were lost
+      // in the air. Both are worth knowing when the radio link is what you're
+      // debugging; neither is visible from the web page.
+      if (indoorLastPrintedSeq != 0) {
+        if (inCopy.seq < indoorLastPrintedSeq) {
+          Serial.printf("[SAT] sequence reset (%lu -> %lu) -- satellite lost power or was reflashed.\n",
+                        (unsigned long)indoorLastPrintedSeq, (unsigned long)inCopy.seq);
+        } else if (inCopy.seq > indoorLastPrintedSeq + 1) {
+          Serial.printf("[SAT] %lu report(s) missed (seq %lu -> %lu).\n",
+                        (unsigned long)(inCopy.seq - indoorLastPrintedSeq - 1),
+                        (unsigned long)indoorLastPrintedSeq, (unsigned long)inCopy.seq);
+        }
+      }
       indoorLastPrintedSeq = inCopy.seq;
-      Serial.printf("Indoor satellite: %.1fF  %.1f%%  %.1f hPa  (seq %lu)\n",
+      if (indoorWasStale) {
+        Serial.println("[SAT] link RECOVERED.");
+        indoorWasStale = false;
+      }
+      Serial.printf("[SAT] %.1fF | %.1f%% | %.1f hPa | seq %lu\n",
                     inCopy.tempF, inCopy.humidity, inCopy.pressureHPa,
                     (unsigned long)inCopy.seq);
     }
+
+    // Link-lost edge. The page already greys the indoor panel out after
+    // INDOOR_STALE_MS; this puts the same transition on the console, which is
+    // where you are looking when the satellite is the suspect.
+    if (inRcvd && !indoorWasStale && (millis() - inMs) >= INDOOR_STALE_MS) {
+      indoorWasStale = true;
+      Serial.printf("[SAT] LINK LOST -- no report for %lus (expected one per minute).\n",
+                    (unsigned long)((millis() - inMs) / 1000UL));
+    }
   }
 
-  // Yield briefly instead of busy-spinning at full speed. The GPS UART
-  // buffer holds ~500ms of data at 9600 baud, so a 2ms nap costs nothing,
-  // and it lets the FreeRTOS idle task run (slightly less CPU heat/power).
-  delay(2);
+  // --- Periodic health summary ---
+  if (now - lastHealthReport >= HEALTH_REPORT_MS) {
+    lastHealthReport = now;
+    IndoorReport  inCopy;
+    bool          inRcvd;
+    unsigned long inMs;
+    snapshotIndoor(inCopy, inRcvd, inMs);
+    Serial.printf("[HEALTH] up %lum | MCP9808 %s (%lu fails) | BME280 %s (%lu fails) | "
+                  "satellite %s | LittleFS %s | WiFi %s | heap %u B\n",
+                  (unsigned long)(now / 60000UL),
+                  mcpHealth.ok ? "ok" : "FAULT", (unsigned long)mcpHealth.totalFails,
+                  bmeHealth.ok ? "ok" : "FAULT", (unsigned long)bmeHealth.totalFails,
+                  !inRcvd ? "never seen" : ((millis() - inMs) < INDOOR_STALE_MS ? "ok" : "STALE"),
+                  littleFsOk ? "ok" : "FAULT",
+                  runningAsAP ? "AP fallback" : (WiFi.status() == WL_CONNECTED ? "connected" : "DOWN"),
+                  (unsigned)ESP.getFreeHeap());
+  }
+
+  // Yield instead of busy-spinning. The GPS build used 2ms because UART1 had
+  // to be drained promptly; with no UART there is nothing time-critical left
+  // in this loop -- AsyncWebServer and ESP-NOW are both interrupt/task
+  // driven, not polled here -- so a longer nap lets the FreeRTOS idle task
+  // run more and costs nothing. Don't push this much past ~10ms: the WiFi
+  // watchdog and history flush are still evaluated from here.
+  delay(10);
 }
