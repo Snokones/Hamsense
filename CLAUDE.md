@@ -13,14 +13,15 @@ There is no build system, package manifest, or test suite in this directory — 
 
 ### Branches
 
-- **`main`** (this branch) — **no GPS module at all.** A ZIP code entered on the web page is resolved through AccuWeather to supply coordinates, elevation and timezone; NTP is the only clock source. **Do not port GPS code back in.**
+- **`lite-ui`** (this branch) — same firmware as `main`, but `web_pages.h` is the condensed mobile-first page: no map, no theme picker, no 7-day panel, **no ZIP box and no forecast**, and zero external CDN dependencies so it loads on a phone with no internet. Coordinates and elevation come from the `STATION` constant at the top of the script instead of a ZIP lookup. **Don't add fields or panels to this page** — that's the whole point of the branch; new UI belongs on `main`.
+- **`main`** — the full page: world map with location pin, colour-theme picker, 7-day high/low panel, ZIP entry and a 5-day AccuWeather forecast. Also carries `ACCUWEATHER_API_KEY` and the `GET /config` endpoint, neither of which exists here.
 - **`gps`** — the older GPS build, kept for reference. An ATGM336H supplied UTC time (primary clock), position, altitude, and date. Time, pressure, and location logic all work differently there; don't copy between the two without reading both.
 
 ### Files referenced but not present here
 
 The sketches `#include` local headers that are gitignored because they hold secrets. `web_pages.h` **is** in this directory and is tracked.
 
-- `secrets.h` — `WIFI_SSID`, `WIFI_PASSWORD`, `FALLBACK_AP_SSID`, `FALLBACK_AP_PASSWORD`, `WEB_USER`, `WEB_PASS`, and `ACCUWEATHER_API_KEY`. Copy from `secrets.h.example`. Missing `WEB_USER`/`WEB_PASS`/`ACCUWEATHER_API_KEY` is a deliberate compile error, not a runtime fallback.
+- `secrets.h` — `WIFI_SSID`, `WIFI_PASSWORD`, `FALLBACK_AP_SSID`, `FALLBACK_AP_PASSWORD`, `WEB_USER`, `WEB_PASS`. Copy from `secrets.h.example`. Missing `WEB_USER`/`WEB_PASS` is a deliberate compile error, not a runtime fallback. No `ACCUWEATHER_API_KEY` on this branch — nothing here contacts AccuWeather.
 - `satellite_secrets.h` — `WIFI_SSID`, `FALLBACK_AP_SSID`, `BASE_MAC` (satellite; copy from `satellite_secrets.h.example` and fill in the base's STA MAC, printed on its Serial Monitor at boot)
 - `web_pages.h` — the `index_html` raw string for the live page. Deliberately kept **out of** `sensor_logger.ino` because the Arduino IDE's ctags-based auto-prototype generator mis-parses JavaScript `function name(...) {}` inside raw string literals as real C++ functions, breaking the build with bogus errors. Keep any HTML/JS payload in this header, not inline in the `.ino`.
 
@@ -55,8 +56,8 @@ Both files use `arduino-esp32` 3.x ESP-NOW callback signatures (`wifi_tx_info_t`
 - **WiFi**: tries the home network 3× (~15s each), then falls back to its own AP (`PotaSense`) with a DNS server that redirects all lookups to `/`. A watchdog in `loop()` restarts the device after 5 minutes of continuous WiFi down (STA mode) or 10+ idle minutes in AP fallback, so it doesn't get stranded.
 - **Never call `WiFi.disconnect(true)`.** The bool is `wifioff` — it tears the WiFi driver down, and doing that once per failed connect attempt corrupted the heap inside the driver's own deinit path (`ppTask` → `wifi_deinit` → `wDev_Rxbuf_Deinit` → `multi_heap_free` → assert). It only reproduces on a boot where the home network is unreachable, which is the one path that repeatedly deinits the radio. Use `WiFi.disconnect(false)`; `WiFi.mode()` handles STA↔AP switching on its own.
 - **Time source**: NTP only, via `configTzTime` in `setup()`, and only in STA mode. There is no other clock source — in AP fallback the clock never syncs, which also means **no temperature history is recorded** (history writes are gated on `getEpochSeconds()` returning true). This is a known, accepted regression from dropping the GPS; don't "fix" it by re-adding GPS.
-- **Pressure**: the firmware reports **raw station pressure** for both the BME280 and the forwarded satellite reading. The ICAO sea-level correction lives in `web_pages.h` (`toSeaLevel()`), because the altitude comes from the ZIP's elevation, which only the browser has. **The correction must exist in exactly one of those two places** — adding it back to the firmware without deleting it from the page applies it twice.
-- **Location**: the ZIP entered on the page resolves to `{lat, lon, elevM, tz, name}`, which `window.setStationLocation()` fans out to the map pin, sunrise/sunset, the clock timezone, and the pressure correction. The firmware knows nothing about it.
+- **Pressure**: the firmware reports **raw station pressure** for both the BME280 and the forwarded satellite reading. The ICAO sea-level correction lives in `web_pages.h` (`toSeaLevel()`), using `STATION.elevM`. **The correction must exist in exactly one of those two places** — adding it back to the firmware without deleting it from the page applies it twice.
+- **Location**: the `STATION` constant at the top of the script in `web_pages.h` (`{lat, lon, elevM}`) is the only source of position on this branch. It drives sunrise/sunset and the pressure correction. The firmware knows nothing about it. `main` resolves the same values from a ZIP; this branch deliberately has no such input.
 - **Shared state across tasks**: the ESP-NOW receive callback runs in the WiFi task; `indoorLast` is protected by a `portMUX_TYPE` spinlock (`portENTER_CRITICAL`/`portEXIT_CRITICAL`) since the 16-byte struct copy isn't atomic. Always use `snapshotIndoor()` to read it, never touch `indoorLast` directly outside the lock.
 - **Sensor fallback pattern**: both MCP9808 and BME280 retry `begin()` from `loop()` if they failed at boot (or ever drop out), so a sensor connected after power-on (or reseated) recovers without a reboot.
 - **Live data push**: `pushSensorData()` runs every 30s, serializes state to JSON via ArduinoJson, and broadcasts over the WebSocket (`ws.textAll`) to all connected clients.
@@ -79,11 +80,10 @@ Both files use `arduino-esp32` 3.x ESP-NOW callback signatures (`wifi_tx_info_t`
 - The fallback AP (`PotaSense`) is a real WiFi network with a password in `secrets.h` — verify `FALLBACK_AP_PASSWORD` is never weakened to an open network without flagging it, since it's reachable by anyone nearby.
 - The DNS-redirect-everything-to-`/` behavior only runs in AP fallback mode — don't extend it to STA mode, since it would silently swallow real 404s and mask misconfigured endpoints.
 - Don't add remote/OTA update mechanisms, new open ports, or new web endpoints without flagging the exposure. Web auth is **per-handler** on `AsyncWebServer`, not global — every new `server.on(...)` needs its own `.setAuthentication(WEB_USER, WEB_PASS)` or it is silently public.
-- `ACCUWEATHER_API_KEY` is served to the browser by `GET /config`. That keeps it out of git but not out of reach of anyone who can log into the page — that's inherent to fetching a keyed API browser-side. Don't hardcode it into `web_pages.h`, which is committed.
 
 ## Working in this repo
 
 - Any change to `IndoorReport` must be mirrored exactly in both files, including the `static_assert` byte count.
 - Don't inline HTML/JS back into `sensor_logger.txt`/`.ino` — keep it in `web_pages.h` to avoid the ctags auto-prototype bug described above.
-- The AccuWeather free tier is 50 calls/day **shared across every browser** that opens the page. The caching in the forecast IIFE (permanent ZIP→location cache, 3-hour forecast TTL) is what keeps it inside that budget. Raising the refresh rate is how you break it.
+- The lite page must stay dependency-free: no CDN scripts, no external fonts, no outbound fetches. It has to render fully on a phone joined to the `PotaSense` AP with no internet. Anything needing the network belongs on `main`.
 - Comments in these files frequently record hardware-specific gotchas (active-low LED pin, I2C address strapping, UART pin mapping, GPS checksum/wake timing) — treat them as load-bearing documentation, not boilerplate, when touching nearby code.

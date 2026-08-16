@@ -1,16 +1,20 @@
-# Hamsense
+# Hamsense — Lite UI
 
 A two-node ESP32-C6 weather station. A **base station** reads outdoor temperature, humidity and pressure, then serves a live web page over WiFi. A battery-powered **indoor satellite** wakes once a minute, takes a reading, radios it to the base over ESP-NOW, and goes back to deep sleep.
 
 Both nodes run on the [Seeed XIAO ESP32-C6](https://wiki.seeedstudio.com/xiao_esp32c6_getting_started/).
 
-> **No GPS.** The ATGM336H and TinyGPS++ are gone. Everything the GPS supplied now comes from a ZIP code you type into the web page, which is resolved through AccuWeather. The older GPS build is preserved on the [`gps`](https://github.com/Snokones/Hamsense/tree/gps) branch.
+> **This is the `lite-ui` branch.** Same firmware as [`main`](https://github.com/Snokones/Hamsense/tree/main), but with a condensed, mobile-first page: no world map, no colour-theme picker, no 7-day panel, no ZIP box and no forecast. It pulls **zero external resources**, so it loads completely on a phone joined only to the station's own `PotaSense` AP with no internet — which is the whole point of it.
+>
+> Because there's no ZIP box, the station's latitude, longitude and elevation are three constants at the top of the script in `web_pages.h`. **Set `STATION` once for your site** — it drives sunrise/sunset and the sea-level pressure correction.
+>
+> **No GPS.** The ATGM336H and TinyGPS++ are gone. The older GPS build is preserved on the [`gps`](https://github.com/Snokones/Hamsense/tree/gps) branch.
 >
 > | GPS gave us | now comes from |
 > |---|---|
 > | UTC time (primary clock) | NTP only |
-> | latitude / longitude | AccuWeather location lookup for the ZIP |
-> | altitude | the same lookup, applied browser-side |
+> | latitude / longitude | the `STATION` constant in `web_pages.h` |
+> | altitude | the `STATION` constant, applied browser-side |
 > | date | the browser's own clock |
 >
 > Two consequences worth knowing before you flash it:
@@ -29,9 +33,8 @@ Reads sensors, keeps time, and serves the UI.
 - **Outdoor temperature** — MCP9808 (high-precision I2C, ±0.25 °C typical)
 - **Humidity + pressure** — BME280 (I2C), reported as raw station pressure
 - **Live web page** — `ESPAsyncWebServer` + WebSocket; readings push to all connected browsers every 30 s
-- **7-day temperature history** — one sample every 15 min stored in a fixed-size ring on flash (LittleFS, `/temps.bin`), served as JSON at `GET /history` and shown as daily highs/lows on the page
-- **5-day forecast + ZIP entry** — fetched by the browser from AccuWeather; the ZIP also supplies the coordinates, elevation and timezone the page needs
-- **Indoor readings** — receives the satellite's `IndoorReport` over ESP-NOW and forwards it raw; the page applies the sea-level correction
+- **7-day temperature history** — one sample every 15 min stored in a fixed-size ring on flash (LittleFS, `/temps.bin`), served as JSON at `GET /history`. Still recorded on this branch, but the lite page draws no history panel; fetch the endpoint directly if you want the data
+- **Indoor readings** — receives the satellite's `IndoorReport` over ESP-NOW and forwards it raw; the page applies the sea-level correction from `STATION.elevM`
 
 **Time source:** NTP only. See the AP-mode caveat at the top.
 
@@ -112,17 +115,23 @@ Defines it provides:
 
 - `WIFI_SSID` / `WIFI_PASSWORD` — your home network
 - `FALLBACK_AP_SSID` / `FALLBACK_AP_PASSWORD` — the `PotaSense` fallback AP
-- `WEB_USER` / `WEB_PASS` — HTTP Basic Auth guarding the page, `/history`, `/config`, and the WebSocket (**required** — the build fails without them)
-- `ACCUWEATHER_API_KEY` — free key from [developer.accuweather.com](https://developer.accuweather.com/) for the forecast panel (**required** — the build fails without it)
+- `WEB_USER` / `WEB_PASS` — HTTP Basic Auth guarding the page, `/history`, and the WebSocket (**required** — the build fails without them)
 - Optional static-IP block (commented out; DHCP by default)
 
-### Using the forecast panel
+No `ACCUWEATHER_API_KEY` on this branch, and no `GET /config` endpoint. Both exist on `main` solely to feed the forecast panel, so requiring a key here would mean registering for a service this build never contacts.
 
-Type a 5-digit US ZIP into the box at the top left of the page. It's stored in that browser's `localStorage`, so each device sets its own, and it drives the forecast, the map pin, sunrise/sunset, the clock's timezone, and the elevation used for the pressure correction.
+### Setting your station location
 
-> **On the AccuWeather free tier.** 50 calls/day for the whole key, shared by every browser that opens the page — and the free tier caps the daily forecast at **5 days**, which is why the panel shows 5 and not 7. The page caches hard to stay inside the quota: ZIP lookups are cached permanently (location keys don't change) and forecasts for 3 hours, so a reload costs zero calls. That works out to roughly 8 calls per device per day. If you hit the quota, raise `FORECAST_TTL_MS` in `web_pages.h` — don't lower it.
->
-> **The API key reaches the browser.** It's served by the auth-gated `GET /config` endpoint, which keeps it out of git but not out of reach of anyone who can log into the page. That's inherent to fetching a keyed API from the browser. Rotate the key if `WEB_PASS` leaks.
+Open `web_pages.h` and edit the one constant near the top of the script:
+
+```js
+const STATION = { lat: 47.606, lon: -122.332, elevM: 0 };
+```
+
+- **`lat` / `lon`** — decimal degrees, south and west negative. Drives sunrise and sunset. Three decimal places (~100 m) is far more precision than sunrise times need.
+- **`elevM`** — station elevation in **metres**. Drives the sea-level pressure correction. Left at `0`, the page reports raw station pressure — honest, but it won't match what your local airport reports.
+
+Worth looking `elevM` up properly rather than guessing: at 1600 m, a 50 m error moves the reported pressure by roughly 6 hPa.
 
 ### Satellite — `satellite_secrets.h`
 
@@ -158,8 +167,7 @@ static_assert(sizeof(IndoorReport) == 16, "...");
 |-------------------------------|--------------------------------------------------------------------|
 | `sensor_logger.txt`           | Base station sketch (rename to `sensor_logger.ino` to build)       |
 | `satellite_sensor.txt`        | Satellite sketch (rename to `satellite_sensor.ino` to build)       |
-| `web_pages.h`                 | `index_html` for the live page — kept out of the `.ino` on purpose |
-| `history_chart.snippet.html`  | Reference snippet for the 7-day history chart (not compiled)       |
+| `web_pages.h`                 | `index_html` for the **lite** page, and the `STATION` constant — kept out of the `.ino` on purpose |
 | `secrets.h.example`           | Template for `secrets.h`                                            |
 | `CLAUDE.md`                   | Guidance for AI coding assistants working in this repo             |
 

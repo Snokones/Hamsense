@@ -2,39 +2,48 @@
   ESP32-C6 multi-sensor station - temperature (MCP9808) + humidity/pressure
   (BME280).  NO-GPS VARIANT.
 
-  This is the no-GPS build of the base station. The ATGM336H and TinyGPS++
-  are gone entirely; everything the GPS used to supply now comes from a ZIP
-  code the user enters on the web page:
+  *** LITE BUILD -- see the "lite-ui" branch note below. ***
 
-    GPS gave us          ->  now comes from
-    -------------------      ------------------------------------------
-    UTC time (primary)   ->  NTP only (see the AP-mode caveat below)
-    latitude/longitude   ->  AccuWeather location lookup for the ZIP
-    altitude             ->  same lookup (GeoPosition.Elevation), applied
-                             browser-side, so the firmware no longer does
-                             any sea-level-pressure correction at all
-    date                 ->  the browser's own clock
+  This is the no-GPS build of the base station. The ATGM336H and TinyGPS++
+  are gone entirely. NTP is the only clock source, and the firmware no longer
+  does any sea-level-pressure correction.
+
+  How this differs from main:
+  - The page (web_pages.h) is the condensed, mobile-first LITE variant: no
+    world map, no theme picker, no 7-day panel, no ZIP entry, no forecast,
+    and ZERO external CDN dependencies -- it loads fully on a phone joined
+    only to the station's own "PotaSense" AP with no internet.
+  - No ACCUWEATHER_API_KEY requirement and no GET /config endpoint. Both
+    exist on main purely to feed the forecast panel this page doesn't have.
+  - The station's fixed latitude/longitude/elevation are three constants at
+    the top of the script in web_pages.h, rather than being resolved from a
+    ZIP the user types. Set them once for your site. That is what drives
+    sunrise/sunset and the pressure correction here.
 
   Consequences worth knowing:
-  - Pressure sent over the WebSocket is now RAW STATION PRESSURE, both for
-    the outdoor BME280 ("p") and the indoor satellite ("in"."p"). The page
-    applies the ICAO sea-level correction using the ZIP's elevation. Do not
-    re-add the correction here without also removing it from web_pages.h,
-    or it will be applied twice.
-  - NTP is the ONLY clock source now. In "PotaSense" AP-fallback mode there
-    is no internet, so the clock never syncs -- and because history writes
-    are gated on a synced clock, no history is recorded while in AP mode.
-    GPS used to cover that case. A DS3231 RTC is the cheap fix if it ever
+  - Pressure sent over the WebSocket is RAW STATION PRESSURE, both for the
+    outdoor BME280 ("p") and the indoor satellite ("in"."p"). The page
+    applies the ICAO sea-level correction using its STATION.elevM constant.
+    Do not re-add the correction here without also removing it from
+    web_pages.h, or it will be applied twice.
+  - NTP is the ONLY clock source. In "PotaSense" AP-fallback mode there is
+    no internet, so the clock never syncs -- and because history writes are
+    gated on a synced clock, no history is recorded while in AP mode. GPS
+    used to cover that case. A DS3231 RTC is the cheap fix if it ever
     matters; re-adding GPS is not.
+  - GET /history and the LittleFS ring are still here and still recording,
+    even though the lite page draws no history panel. The JSON is available
+    if you want it; keeping the firmware identical to main here avoids a
+    third variant to maintain.
 
-  Other features (unchanged from the GPS build):
+  Other features:
   - AsyncWebServer + WebSocket, single live page, HTTP Basic Auth
   - ESP-NOW receiver for the indoor satellite node (satellite_sensor.ino,
     a XIAO ESP32-C6 + BME280 that deep-sleeps and reports every minute);
     the IndoorReport struct here must match the satellite's exactly
   - 30s sampling, pushed live to connected clients over WebSocket
   - 7-day temperature history on flash (LittleFS), served at GET /history
-  - Seven-segment display, day/night Mercator map, WS auto-reconnect
+  - Seven-segment display, WS auto-reconnect
   - WiFi: tries the home network (3 attempts), falls back to broadcasting
     its own AP ("PotaSense") with a DNS redirect if it can't connect
 
@@ -70,13 +79,11 @@
 #include <LittleFS.h>  // on-flash temperature history (/temps.bin) -- part of the ESP32 core
 #include "secrets.h"   // WIFI_SSID / WIFI_PASSWORD live here -- not in this file, not in git
 
-// Fail the build loudly rather than shipping an empty key and debugging a
-// silently broken forecast panel later. Same philosophy as WEB_USER/WEB_PASS:
-// if it's required, its absence should be a compile error, not a runtime
-// surprise. Get a free key at https://developer.accuweather.com/.
-#ifndef ACCUWEATHER_API_KEY
-#error "ACCUWEATHER_API_KEY missing from secrets.h -- copy secrets.h.example and fill it in."
-#endif
+// LITE BUILD: no ACCUWEATHER_API_KEY requirement and no GET /config endpoint.
+// The full build serves that key to the browser so the page can fetch a
+// forecast; the lite page has no forecast panel, so requiring an API key here
+// would make people register for a service this build never contacts. If you
+// ever add a forecast to the lite page, take both back from main.
 
 // Forward declaration for the Arduino IDE's auto-prototype generator: it
 // inserts function prototypes near the top of the file, BEFORE our type
@@ -814,29 +821,9 @@ void setup() {
     request->send(200, "application/json", historyToJson());
   }).setAuthentication(WEB_USER, WEB_PASS);
 
-  // --- /config: hands the AccuWeather API key to the page ---
-  // The forecast is fetched by the BROWSER, so the key has to reach the
-  // JavaScript somehow. Serving it from here keeps it in secrets.h (which is
-  // gitignored) instead of hardcoding it into web_pages.h (which is
-  // committed) -- that is the whole point of this endpoint.
-  //
-  // Be clear about what this does and does not buy you: the key stays out of
-  // git, but anyone who can log into the page can read it, either from this
-  // response or from the browser's network tab. That is inherent to
-  // browser-side fetching of a keyed API, not a flaw in this handler. The
-  // key is rate-limited (50 calls/day free tier) and grants nothing except
-  // weather lookups, so the exposure is bounded -- but rotate it if the page
-  // password ever leaks.
-  //
-  // Auth is per-handler on this server, not global. Forgetting the
-  // .setAuthentication() below would publish the key to anyone on the LAN.
-  // AccuWeather keys are alphanumeric, so no JSON escaping is needed.
-  server.on("/config", HTTP_GET, [](AsyncWebServerRequest *request){
-    String cfg = "{\"awkey\":\"";
-    cfg += ACCUWEATHER_API_KEY;
-    cfg += "\"}";
-    request->send(200, "application/json", cfg);
-  }).setAuthentication(WEB_USER, WEB_PASS);
+  // (No /config endpoint on the lite build -- see the note near the top of
+  // this file. It exists on main only to hand the AccuWeather key to the
+  // forecast panel, which this page doesn't have. One less public surface.)
 
   // In fallback AP mode, redirect any unrecognized request to "/" -- this is
   // what makes "any URL the phone tries to load" land on the sensor page,
