@@ -1,14 +1,20 @@
 // web_pages.h  (LITE variant)
 //
-// Condensed, mobile-first live-readings page for the "lite" build. This is
-// the same data feed as the full page (identical WebSocket JSON: h/t/p/ts/
-// sync, the nested "in" indoor object, and the nested "gps" object), but
-// stripped down to just the readings + clock + GPS-derived extras. Removed
-// vs the full page: the day/night world map (and its d3/topojson CDN
-// dependencies), the color-theme picker, and the 7-day high/low panel. The
-// result loads with ZERO external network dependencies -- everything is
-// inline, so it works on a phone that's only joined to the station's own
-// fallback AP with no internet.
+// Condensed, mobile-first live-readings page for the "lite" build. Same data
+// feed as the full page (WebSocket JSON: h/t/p/ts/sync plus the nested "in"
+// indoor object), stripped down to readings + indoor + clock. Removed vs the
+// full page: the day/night world map (and its d3/topojson CDN dependencies),
+// the colour-theme picker, the 7-day high/low panel, the ZIP entry box and
+// the 5-day forecast panel. The result loads with ZERO external network
+// dependencies -- everything is inline, so it works on a phone that's only
+// joined to the station's own fallback AP with no internet.
+//
+// NOTE: the firmware no longer sends a "gps" object, and "p" / "in"."p" are
+// now RAW STATION PRESSURE. The full page gets its coordinates and elevation
+// from a ZIP the user types; this page deliberately has no such box, so it
+// takes them from the STATION constant at the top of the script instead.
+// Set that once for your site -- it drives sunrise/sunset and the sea-level
+// pressure correction. Leaving elevM at 0 simply reports station pressure.
 //
 // The raw string literal lives here (not inline in the .ino) for the same
 // reason as the full page: the Arduino IDE's ctags auto-prototype generator
@@ -34,7 +40,13 @@ const char index_html[] PROGMEM = R"rawliteral(
 <meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'/>
 <title>Hamsense Lite</title>
 <style>
-:root{--theme-main:#ff8c00;--theme-glow:#cc7000;--theme-dim:#c98a2e;}
+/* Palette matches main's brightened amber. On black, perceived brightness
+   tracks relative luminance -- the old #ff8c00 sat at 0.40 and read flat.
+   --theme-glow is deliberately BRIGHTER than --theme-main, not darker: a
+   halo darker than the segment it surrounds muddies the edge instead of
+   spreading light. There is no theme picker on the lite page, so these are
+   the only colours in play. */
+:root{--theme-main:#ffb04d;--theme-glow:#ff8c00;--theme-dim:#e8a962;}
 *{box-sizing:border-box;}
 html,body{margin:0;min-height:100%;background:#000;}
 body{color:var(--theme-main);font-family:Arial,Helvetica,sans-serif;text-align:center;
@@ -50,8 +62,13 @@ body{color:var(--theme-main);font-family:Arial,Helvetica,sans-serif;text-align:c
 .reading .rlbl{align-self:center;font-size:12px;color:var(--theme-dim);
  letter-spacing:0.08em;min-width:3.2em;text-align:left;}
 .digit{position:relative;width:28px;height:47px;display:inline-block;margin:0 2px;}
-.seg{position:absolute;background:transparent;border-radius:2px;transition:0.2s;}
-.on{background:var(--theme-main);box-shadow:0 0 4px var(--theme-main),0 0 7px var(--theme-glow);}
+/* Name the transitioned properties rather than using `all`: with `all`, a
+   change to --theme-main does not invalidate already-painted segments in
+   Chromium. Moot here (no theme picker) but wrong is wrong, and it matches main. */
+.seg{position:absolute;background:transparent;border-radius:2px;transition:background-color 0.2s,box-shadow 0.2s;}
+/* Three bloom layers: tight core, mid halo, wide spill. The wide layer is
+   what actually reads as glowing on black. */
+.on{background:var(--theme-main);box-shadow:0 0 5px var(--theme-main),0 0 13px var(--theme-glow),0 0 26px var(--theme-glow);}
 .A{top:0;left:5px;width:18px;height:5px;}
 .B{top:5px;right:0;width:5px;height:18px;}
 .C{bottom:5px;right:0;width:5px;height:18px;}
@@ -62,8 +79,8 @@ body{color:var(--theme-main);font-family:Arial,Helvetica,sans-serif;text-align:c
 .unit{font-size:18px;color:var(--theme-main);opacity:0.9;align-self:center;min-width:2.6em;text-align:left;}
 .unit-small{font-size:15px;}
 .dot-container{width:10px;display:inline-block;height:47px;vertical-align:bottom;}
-.dot{width:5px;height:5px;border-radius:50%;background:transparent;margin:0 auto;position:relative;top:37px;transition:0.2s;}
-.dot.on{background:var(--theme-main);box-shadow:0 0 4px var(--theme-main),0 0 7px var(--theme-glow);}
+.dot{width:5px;height:5px;border-radius:50%;background:transparent;margin:0 auto;position:relative;top:37px;transition:background-color 0.2s,box-shadow 0.2s;}
+.dot.on{background:var(--theme-main);box-shadow:0 0 5px var(--theme-main),0 0 13px var(--theme-glow),0 0 26px var(--theme-glow);}
 
 /* --- indoor: plain numerics, compact --- */
 .indoor{border:1px solid var(--theme-main);border-radius:8px;background:rgba(0,0,0,0.25);
@@ -102,11 +119,11 @@ body{color:var(--theme-main);font-family:Arial,Helvetica,sans-serif;text-align:c
 </div>
 
 <div class='clock'>
-  <div><span class='tz-label'>UTC</span><span id='clockUtc'>--:--</span><span class='grid-sep'></span><span class='tz-label'>GRID</span><span id='gridSquare'>--</span></div>
+  <div><span class='tz-label'>UTC</span><span id='clockUtc'>--:--</span></div>
   <div><span class='tz-label'>&#8593;</span><span id='sunrise'>--:--</span><span class='grid-sep'></span><span class='tz-label'>&#8595;</span><span id='sunset'>--:--</span></div>
   <div>
     <select id='tzSelect' class='tz-select'></select>
-    <span id='clockLocal'>--:--</span><span class='grid-sep'></span><span id='gpsDate' class='tz-label'>--/--/----</span>
+    <span id='clockLocal'>--:--</span><span class='grid-sep'></span><span id='localDate' class='tz-label'>--/--/----</span>
   </div>
 </div>
 
@@ -175,40 +192,41 @@ function render(id, val, decimals=1){
 // 1 hPa = 0.0295299830714 inHg (exact conversion factor)
 function hPaToInHg(hpa){ return hpa * 0.0295299830714; }
 
-// ---- GPS-derived display helpers ----
+// ============================================================
+// STATION -- set these three numbers once for your site.
+// ============================================================
+// The full build resolves these from a ZIP code the user types. The lite
+// page has no such box by design, so they are constants here.
+//
+//   lat / lon : decimal degrees, south and west negative. Drives sunrise
+//               and sunset. Get them from any map -- three decimal places
+//               (~100 m) is far more precision than sunrise times need.
+//   elevM     : station elevation in METRES above sea level. Drives the
+//               sea-level pressure correction below. Leave it at 0 and the
+//               page simply reports raw station pressure, which is honest
+//               but won't match what your local airport reports.
+//
+// Getting elevM wrong skews pressure noticeably: at 1600 m an error of 50 m
+// moves the result by roughly 6 hPa, so it's worth looking up properly
+// rather than guessing.
+const STATION = { lat: 47.606, lon: -122.332, elevM: 0 };
 
-// Maidenhead grid square locator (4-character) from GPS coordinates.
-// Verified against known references: Seattle=CN87, Manhattan=FN30, London=IO91.
-function maidenhead4(lat, lon) {
-  const lonAdj = lon + 180.0;
-  const latAdj = lat + 90.0;
-  const fLon = Math.floor(lonAdj / 20);
-  const fLat = Math.floor(latAdj / 10);
-  const sLon = Math.floor((lonAdj % 20) / 2);
-  const sLat = Math.floor(latAdj % 10);
-  return String.fromCharCode(65+fLon) + String.fromCharCode(65+fLat) + sLon + sLat;
+// Sea-level pressure reduction, ICAO standard barometric formula:
+//   SLP = P_station * (1 + (0.0065 * alt_m) / T_K) ^ 5.2561
+// The firmware sends RAW station pressure and does no correction, so this is
+// the only place it happens -- if you ever move it back into the sketch,
+// delete it here or it gets applied twice.
+//
+// Uses the OUTDOOR temperature: the air column being modelled is the one
+// outside, between the station and sea level.
+function toSeaLevel(stationHPa, outdoorTempF) {
+  if (!STATION.elevM) return stationHPa;   // elevM 0 -> no correction
+  const tK = (outdoorTempF - 32) * 5 / 9 + 273.15;
+  if (!isFinite(tK) || tK <= 0) return stationHPa;
+  return stationHPa * Math.pow(1 + (0.0065 * STATION.elevM) / tK, 5.2561);
 }
 
-// Approximate IANA timezone from lat/lon for the US. Longitude bands with
-// explicit exceptions for Arizona (no DST) and Alaska/Hawaii. Accurate for
-// major US cities; used only to auto-select the dropdown -- the user can
-// always override manually.
-function approxTimezone(lat, lon) {
-  if (lat < 25 && lon < -140)   return 'Pacific/Honolulu';
-  if (lat > 54 || (lat > 50 && lon < -141)) return 'America/Anchorage';
-  if (lon < -114)                return 'America/Los_Angeles';
-  if (lon < -104) {
-    if (lat > 31 && lat < 37.5 && lon > -115) return 'America/Phoenix';
-    return 'America/Denver';
-  }
-  if (lon < -85.5)               return 'America/Chicago';
-  return 'America/New_York';
-}
-
-// Track whether the timezone was set by GPS (auto) vs the user manually.
-let tzSetByUser = false;
-
-// NOAA sunrise/sunset algorithm for the GPS coordinates + current GPS date.
+// NOAA sunrise/sunset algorithm for the station coordinates on today's date.
 // Returns {sunrise, sunset} as UTC Date objects, or null on polar day/night.
 function calcSunriseSunset(latDeg, lonDeg, year, month, day) {
   const lat = latDeg * Math.PI / 180;
@@ -245,43 +263,42 @@ function formatLocalTime(dateUtc) {
   }).format(dateUtc);
 }
 
-// Cache last-known GPS fix so sunrise/sunset + date can be recomputed on a
-// timezone change without waiting for the next WS push.
-let _lastGpsFix = null;
+// Last WS payload, so the readouts can be re-rendered on demand.
+let _lastWs = null;
 
 function updateSunriseSunset() {
-  if (!_lastGpsFix) return;
-  const { lat, lon, year, mon, day } = _lastGpsFix;
-  const sun = calcSunriseSunset(lat, lon, year, mon, day);
+  // Today's UTC date: the NOAA algorithm works in UTC and returns UTC
+  // instants, which formatLocalTime() then renders in the selected zone.
+  const now = new Date();
+  const sun = calcSunriseSunset(STATION.lat, STATION.lon,
+                                now.getUTCFullYear(), now.getUTCMonth() + 1, now.getUTCDate());
   if (sun) {
     document.getElementById('sunrise').textContent = formatLocalTime(sun.sunrise);
     document.getElementById('sunset').textContent  = formatLocalTime(sun.sunset);
   } else {
-    document.getElementById('sunrise').textContent = 'N/A';
+    document.getElementById('sunrise').textContent = 'N/A'; // polar day or night
     document.getElementById('sunset').textContent  = 'N/A';
   }
 }
 
+// Date straight off the browser clock, rendered in the selected zone. The
+// firmware no longer supplies a date, and there is no reason to reconstruct
+// one when the browser already has it.
 function updateDate() {
-  if (!_lastGpsFix) return;
-  const { year, mon, day, ts } = _lastGpsFix;
-  if (!year || !mon || !day) return;
-  const gpsUtcMs = Date.UTC(year, mon-1, day,
-                            ts ? Math.floor((ts % 86400) / 3600) : 0,
-                            ts ? Math.floor((ts % 3600) / 60) : 0,
-                            ts ? (ts % 60) : 0);
-  document.getElementById('gpsDate').textContent = new Intl.DateTimeFormat('en-US', {
+  document.getElementById('localDate').textContent = new Intl.DateTimeFormat('en-US', {
     timeZone: document.getElementById('tzSelect').value || 'America/Los_Angeles',
     month: '2-digit', day: '2-digit', year: 'numeric'
-  }).format(new Date(gpsUtcMs));
+  }).format(new Date());
 }
 
 // ---- WebSocket handler ----
-connectWS((event)=>{
-  let data = JSON.parse(event.data);
+// Split out of the callback so a timezone change can re-render without
+// waiting up to 30s for the next push.
+function renderReadings(data) {
   render('hum', data.h);
   render('temp', data.t);
-  render('press', hPaToInHg(data.p), 2);
+  // data.p is RAW station pressure from the firmware; reduce it here.
+  render('press', hPaToInHg(toSeaLevel(data.p, data.t)), 2);
 
   const statusEl = document.getElementById('timeStatus');
   if (data.sync) {
@@ -292,48 +309,26 @@ connectWS((event)=>{
     statusEl.className = 'status';
   }
 
-  // GPS-derived extras (grid square, sunrise/sunset, date) when a fix exists.
-  if (data.gps && data.gps.fix && data.gps.lat != null && data.gps.lon != null) {
-    const lat = data.gps.lat, lon = data.gps.lon;
-    const year = data.gps.year, mon = data.gps.mon, day = data.gps.day;
-
-    document.getElementById('gridSquare').textContent = maidenhead4(lat, lon);
-
-    _lastGpsFix = { lat, lon, year, mon, day, ts: data.ts };
-    updateSunriseSunset();
-    updateDate();
-
-    // Auto-select timezone from GPS, unless the user already chose one.
-    if (!tzSetByUser) {
-      const ianaGuess = approxTimezone(lat, lon);
-      const sel = document.getElementById('tzSelect');
-      if (Array.from(sel.options).some(o => o.value === ianaGuess)) {
-        if (sel.value !== ianaGuess) {
-          sel.value = ianaGuess;
-          buildLocalFormatter(ianaGuess);
-          tickClock();
-          updateSunriseSunset();
-        }
-      }
-    }
-  } else {
-    document.getElementById('gridSquare').textContent = '--';
-    document.getElementById('sunrise').textContent = '--:--';
-    document.getElementById('sunset').textContent  = '--:--';
-    document.getElementById('gpsDate').textContent = '--/--/----';
-  }
-
   // Indoor satellite panel. "ok" is false before the first report and after
   // the node goes quiet 3+ min -- show "--" then rather than stale data.
+  // Its pressure gets the same reduction, deliberately using the OUTDOOR
+  // temperature: the air column between here and sea level is outside.
   if (data.in && data.in.ok) {
     document.getElementById('inHum').textContent   = data.in.h.toFixed(1);
     document.getElementById('inTemp').textContent  = data.in.t.toFixed(1);
-    document.getElementById('inPress').textContent = hPaToInHg(data.in.p).toFixed(2);
+    document.getElementById('inPress').textContent =
+      hPaToInHg(toSeaLevel(data.in.p, data.t)).toFixed(2);
   } else {
     document.getElementById('inHum').textContent   = '--';
     document.getElementById('inTemp').textContent  = '--';
     document.getElementById('inPress').textContent = '--';
   }
+}
+
+connectWS((event)=>{
+  const data = JSON.parse(event.data);
+  _lastWs = data;
+  renderReadings(data);
 });
 
 // ---- Live clock (ticks off the browser clock, smooth between WS pushes) ----
@@ -381,25 +376,29 @@ US_TIMEZONES.forEach(tz => {
 const savedTz = loadSavedTimezone();
 tzSelect.value = savedTz;
 buildLocalFormatter(savedTz);
-// A saved value counts as a user choice so GPS auto-select won't override it.
-if (localStorage.getItem('clockTimezone')) tzSetByUser = true;
 
 tzSelect.addEventListener('change', () => {
-  tzSetByUser = true;
   buildLocalFormatter(tzSelect.value);
   saveTimezone(tzSelect.value);
   tickClock();
   updateSunriseSunset();
-  updateDate();
 });
 
 function tickClock() {
   const now = new Date();
   document.getElementById('clockUtc').textContent = utcFormatter.format(now);
   document.getElementById('clockLocal').textContent = localFormatter.format(now);
+  // The date comes from this same browser clock now, so refresh it on the
+  // tick -- otherwise it would sit on yesterday's date until a tz change.
+  updateDate();
 }
 tickClock();
 setInterval(tickClock, 5000);
+
+// Sunrise/sunset depend only on STATION and today's date, so compute them
+// once at load rather than waiting for a WebSocket push. They are also
+// recomputed on a timezone change, and the 5s tick rolls the date over.
+updateSunriseSunset();
 </script>
 
 </body></html>
