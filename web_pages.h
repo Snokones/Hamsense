@@ -102,10 +102,18 @@ a{color:var(--theme-main);text-decoration:none;margin-top:22px;display:block;tex
    theme button). */
 .forecast-panel{position:fixed;top:14px;left:14px;z-index:1;border:1px solid var(--theme-main);border-radius:8px;background:rgba(0,0,0,0.25);padding:10px 14px;text-align:left;color:var(--theme-main);font-family:Arial;min-width:200px;}
 .forecast-title{font-size:12px;color:var(--theme-dim);letter-spacing:0.08em;margin-bottom:6px;}
-.zip-row{display:flex;align-items:center;gap:7px;margin-bottom:7px;}
-.zip-input{width:5em;background:transparent;color:var(--theme-main);border:1px solid var(--theme-dim);border-radius:4px;font-family:Arial;font-size:13px;padding:2px 5px;}
-.zip-input:focus{outline:1px solid var(--theme-main);}
-.zip-place{font-size:11px;color:var(--theme-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:12em;}
+.loc-row{display:flex;align-items:center;gap:6px;margin-bottom:6px;}
+.coord-input{width:5.2em;background:transparent;color:var(--theme-main);border:1px solid var(--theme-dim);border-radius:4px;font-family:Arial;font-size:13px;padding:2px 5px;}
+.coord-input:focus{outline:1px solid var(--theme-main);}
+.loc-clear{background:transparent;color:var(--theme-dim);border:1px solid var(--theme-dim);border-radius:4px;font-size:14px;line-height:1;padding:2px 7px;cursor:pointer;font-family:Arial;}
+.loc-clear:hover{color:var(--theme-main);border-color:var(--theme-main);}
+.elev-row{display:flex;align-items:center;gap:6px;margin-bottom:6px;font-size:11px;color:var(--theme-dim);letter-spacing:0.06em;}
+.elev-input{width:4.8em;background:transparent;color:var(--theme-main);border:1px solid var(--theme-dim);border-radius:4px;font-family:Arial;font-size:13px;padding:2px 5px;}
+.elev-input:focus{outline:1px solid var(--theme-main);}
+/* Dimmed while the value came from the automatic lookup rather than the user,
+   so it's obvious at a glance which elevation you're actually looking at. */
+.elev-input.auto{color:var(--theme-dim);}
+.loc-place{display:block;font-size:11px;color:var(--theme-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:13em;margin-bottom:6px;}
 .forecast-row{font-size:15px;line-height:1.45;white-space:nowrap;}
 .forecast-row .lbl{color:var(--theme-dim);font-size:0.75em;margin-right:8px;display:inline-block;min-width:2.6em;}
 .forecast-row .sep{color:var(--theme-dim);margin:0 4px;}
@@ -162,10 +170,17 @@ a{color:var(--theme-main);text-decoration:none;margin-top:22px;display:block;tex
 
 <div class='forecast-panel'>
   <div class='forecast-title'>5-DAY FORECAST</div>
-  <div class='zip-row'>
-    <input id='zipInput' class='zip-input' type='text' inputmode='numeric' maxlength='5' placeholder='ZIP' aria-label='ZIP code'/>
-    <span id='zipPlace' class='zip-place'>enter a ZIP</span>
+  <div class='loc-row'>
+    <input id='latInput' class='coord-input' type='text' inputmode='decimal' placeholder='lat' aria-label='Latitude'/>
+    <input id='lonInput' class='coord-input' type='text' inputmode='decimal' placeholder='lon' aria-label='Longitude'/>
+    <button id='locClear' class='loc-clear' title='Clear location' aria-label='Clear location'>&#215;</button>
   </div>
+  <div class='elev-row'>
+    <span>ELEV</span>
+    <input id='elevInput' class='elev-input' type='text' inputmode='decimal' placeholder='auto' aria-label='Elevation in metres'/>
+    <span>m</span>
+  </div>
+  <span id='locPlace' class='loc-place'>enter coordinates</span>
   <div id='fcRows'></div>
   <div id='fcNote' class='forecast-note'></div>
 </div>
@@ -182,6 +197,9 @@ let _projectFn = null;
 window.initMapPin = function(layer, projFn) {
   _pinLayer = layer;
   _projectFn = projFn;
+};
+window.clearLocationPin = function() {
+  if (_pinLayer) _pinLayer.selectAll('.loc-pin').remove();
 };
 window.setLocationPin = function(lat, lon) {
   if (!_pinLayer || !_projectFn) return;
@@ -522,6 +540,19 @@ window.setStationLocation = function(loc) {
   if (_lastWs) renderReadings(_lastWs);
 };
 
+// Called when the user clears the location. Everything that keyed off it goes
+// back to its no-location state: the pin disappears, sunrise/sunset blank, and
+// pressure reverts to raw station pressure via toSeaLevel()'s !_loc guard.
+// The timezone selection is deliberately left alone -- it's a display
+// preference the user may have set by hand, and silently resetting it would
+// be surprising.
+window.clearStationLocation = function() {
+  _loc = null;
+  if (window.clearLocationPin) window.clearLocationPin();
+  updateSunriseSunset();
+  if (_lastWs) renderReadings(_lastWs);
+};
+
 // ---- WebSocket handler ----
 // Split out of the socket callback so setStationLocation() can re-run it the
 // moment a ZIP resolves -- both pressure readouts depend on the elevation.
@@ -821,18 +852,34 @@ applyTheme(loadSavedTheme());
 })();
 </script>
 <script>
-// ---- ZIP entry + 5-day forecast (top-left panel) ----
+// ---- Location entry + 5-day forecast (top-left panel) ----
 //
 // This runs in the BROWSER, not on the ESP32. The firmware has no HTTP client
 // and no TLS stack; adding one to a C6 already running AsyncWebServer +
 // LittleFS + ESP-NOW + ArduinoJson would cost heap and radio power for no
 // benefit, since the device viewing this page already has internet.
 //
-// QUOTA IS THE DESIGN CONSTRAINT HERE. AccuWeather's free tier is 50 calls per
-// day for the whole API key, shared by every browser that opens this page. So:
-//   * the ZIP -> location lookup is cached FOREVER (location keys are stable),
-//     costing one call per ZIP for the life of the browser profile;
-//   * the forecast is cached for 3 hours, and a page reload renders from that
+// The user enters latitude and longitude directly. This replaced a ZIP box:
+// a ZIP resolved to AccuWeather's coarse city-level elevation, which fed the
+// sea-level pressure correction and made the reported pressure wrong by more
+// than the correction was worth. Coordinates give an exact point, and the
+// elevation for that point comes from Open-Meteo's terrain model -- keyless
+// and outside the AccuWeather quota -- with the field left editable so a bad
+// DEM value or an unusual site can be corrected by hand.
+//
+// TWO SEPARATE SERVICES, deliberately:
+//   * Open-Meteo  -> elevation. Free, no key, no quota. Runs FIRST and
+//     independently, because pressure depends on it and it must keep working
+//     when the forecast doesn't.
+//   * AccuWeather -> forecast + timezone + place name, via the geoposition
+//     endpoint (not postal codes, so it works anywhere, not just US ZIPs).
+//
+// QUOTA IS THE DESIGN CONSTRAINT for the AccuWeather half. Free tier is 50
+// calls/day for the whole key, shared by every browser that opens this page:
+//   * the coordinate -> location lookup is cached FOREVER (location keys are
+//     stable), keyed on coordinates rounded to 3 decimals (~100 m) so small
+//     edits don't each cost a call;
+//   * the forecast is cached for 3 hours, and a reload renders from that
 //     cache with ZERO calls.
 // That works out to ~8 calls/device/day. For scale: refreshing every 5 minutes
 // the way the history panel does would be 288 calls/day from a single tab and
@@ -842,15 +889,28 @@ applyTheme(loadSavedTheme());
 // paid), which is why this panel shows 5 and not 7.
 (function(){
   const FORECAST_TTL_MS = 3 * 60 * 60 * 1000; // see quota note above
-  const ZIP_KEY = 'zipCode';
+  const LAT_KEY  = 'stationLat';
+  const LON_KEY  = 'stationLon';
+  const ELEV_KEY = 'stationElevM';    // the value in use (auto or manual)
+  const ELEV_MANUAL_KEY = 'stationElevManual'; // '1' = user typed it; don't overwrite
   const AW = 'https://dataservice.accuweather.com';
-  function locKeyFor(zip){ return 'awLoc:' + zip; }
-  function fcKeyFor(zip){ return 'awFc:' + zip; }
+  const OPEN_METEO_ELEV = 'https://api.open-meteo.com/v1/elevation';
 
-  const zipInput = document.getElementById('zipInput');
-  const zipPlace = document.getElementById('zipPlace');
-  const fcRows   = document.getElementById('fcRows');
-  const fcNote   = document.getElementById('fcNote');
+  // Cache keys are rounded to 3 decimals (~100 m). Without that, nudging a
+  // coordinate by a metre would look like a brand new location and burn an
+  // AccuWeather call from a 50/day budget every time.
+  function coordKey(lat, lon){ return lat.toFixed(3) + ',' + lon.toFixed(3); }
+  function locKeyFor(ck){ return 'awLoc:' + ck; }
+  function fcKeyFor(ck){ return 'awFc:' + ck; }
+  function elevKeyFor(ck){ return 'elev:' + ck; }
+
+  const latInput  = document.getElementById('latInput');
+  const lonInput  = document.getElementById('lonInput');
+  const elevInput = document.getElementById('elevInput');
+  const locClear  = document.getElementById('locClear');
+  const locPlace  = document.getElementById('locPlace');
+  const fcRows    = document.getElementById('fcRows');
+  const fcNote    = document.getElementById('fcNote');
 
   let apiKey = null;
   let busy = false;
@@ -889,39 +949,66 @@ applyTheme(loadSavedTheme());
     return r.json();
   }
 
-  // ZIP -> { key, name, lat, lon, elevM, tz }, cached permanently: AccuWeather
-  // location keys don't change, so re-fetching one is a wasted call.
-  // details=true is REQUIRED -- without it the response carries no Elevation,
-  // and the pressure correction depends on it.
-  function resolveLocation(zip){
-    const cached = readJson(locKeyFor(zip));
+  // Coordinates -> { key, name, tz }, cached permanently. AccuWeather location
+  // keys are stable, so re-fetching one for the same point is a wasted call.
+  // Uses the geoposition endpoint rather than the postal-code one: the user
+  // now supplies a point directly, and this accepts any point on Earth rather
+  // than just US ZIPs.
+  //
+  // NOTE: lat/lon and elevation deliberately do NOT come from this response.
+  // The user's own coordinates are more precise than the city AccuWeather
+  // snaps to, and its elevation is a coarse value for that city -- which is
+  // exactly the inaccuracy this whole change exists to fix. Only the location
+  // key (for the forecast), the display name, and the timezone are taken.
+  function resolveLocation(lat, lon){
+    const ck = coordKey(lat, lon);
+    const cached = readJson(locKeyFor(ck));
     if (cached && cached.key) return Promise.resolve(cached);
     return getApiKey().then(function(k){
       if (!k) throw new Error('no-key');
-      return fetch(AW + '/locations/v1/postalcodes/US/search?apikey=' + encodeURIComponent(k)
-                   + '&q=' + encodeURIComponent(zip) + '&details=true').then(checkStatus);
-    }).then(function(arr){
-      if (!arr || !arr.length) throw new Error('no-zip');
-      const L = arr[0];
-      const g = L.GeoPosition || {};
-      const hasElev = g.Elevation && g.Elevation.Metric && typeof g.Elevation.Metric.Value === 'number';
+      return fetch(AW + '/locations/v1/cities/geoposition/search?apikey=' + encodeURIComponent(k)
+                   + '&q=' + encodeURIComponent(lat + ',' + lon)).then(checkStatus);
+    }).then(function(L){
+      if (!L || !L.Key) throw new Error('no-location');
       const loc = {
         key:  L.Key,
-        name: (L.LocalizedName || zip) +
+        name: (L.LocalizedName || '') +
               (L.AdministrativeArea && L.AdministrativeArea.ID ? ', ' + L.AdministrativeArea.ID : ''),
-        lat:  g.Latitude,
-        lon:  g.Longitude,
-        elevM: hasElev ? g.Elevation.Metric.Value : 0, // 0 = no correction applied
         tz:   (L.TimeZone && L.TimeZone.Name) || null
       };
-      lsSet(locKeyFor(zip), JSON.stringify(loc));
+      lsSet(locKeyFor(ck), JSON.stringify(loc));
       return loc;
     });
   }
 
+  // Elevation for a point, from Open-Meteo's terrain model. Keyless, no quota,
+  // and CORS-enabled, so it costs nothing against the AccuWeather budget.
+  //
+  // It's a ~90 m digital elevation model, so it's the terrain height at the
+  // point, not your antenna mast or your floor of the building -- spot checks:
+  // Denver 1599 (true ~1609), Seattle 59. Good to a few metres at a normal
+  // site, which is well under a hPa of pressure error. Sharp peaks get
+  // smoothed and read low. That's precisely why the field stays editable.
+  //
+  // Cached permanently per rounded coordinate: terrain does not move.
+  function lookupElevation(lat, lon){
+    const ck = coordKey(lat, lon);
+    const cached = lsGet(elevKeyFor(ck));
+    if (cached !== null && cached !== '') return Promise.resolve(parseFloat(cached));
+    return fetch(OPEN_METEO_ELEV + '?latitude=' + encodeURIComponent(lat)
+                 + '&longitude=' + encodeURIComponent(lon))
+      .then(function(r){ if (!r.ok) throw new Error('elev-http-' + r.status); return r.json(); })
+      .then(function(j){
+        const v = (j && j.elevation && j.elevation.length) ? j.elevation[0] : null;
+        if (typeof v !== 'number') throw new Error('elev-bad-response');
+        lsSet(elevKeyFor(ck), String(v));
+        return v;
+      });
+  }
+
   // metric=false so temperatures arrive in F and match the rest of the page.
-  function loadForecast(zip, locationKey){
-    const cached = readJson(fcKeyFor(zip));
+  function loadForecast(ck, locationKey){
+    const cached = readJson(fcKeyFor(ck));
     if (cached && cached.t && (Date.now() - cached.t) < FORECAST_TTL_MS) {
       return Promise.resolve(cached.days); // cache hit -- no API call
     }
@@ -938,7 +1025,7 @@ applyTheme(loadSavedTheme());
           cond: (d.Day && d.Day.IconPhrase) || ''
         };
       });
-      lsSet(fcKeyFor(zip), JSON.stringify({ t: Date.now(), days: days }));
+      lsSet(fcKeyFor(ck), JSON.stringify({ t: Date.now(), days: days }));
       return days;
     }).catch(function(err){
       // Show stale data rather than blanking the panel on a transient failure.
@@ -965,16 +1052,50 @@ applyTheme(loadSavedTheme());
   }
 
   const MESSAGES = {
-    'no-key':  'no API key -- set ACCUWEATHER_API_KEY in secrets.h',
-    'bad-key': 'API key rejected -- check ACCUWEATHER_API_KEY',
-    'quota':   'AccuWeather daily quota used up -- resets tomorrow',
-    'no-zip':  'ZIP not found'
+    'no-key':      'no API key -- set ACCUWEATHER_API_KEY in secrets.h',
+    'bad-key':     'API key rejected -- check ACCUWEATHER_API_KEY',
+    'quota':       'AccuWeather daily quota used up -- resets tomorrow',
+    'no-location': 'no forecast location near those coordinates'
   };
 
+  // Stored coordinates, or null if none/invalid. Validated on read as well as
+  // on write, so a hand-edited localStorage can't feed NaN into the pressure
+  // maths or the sunrise solver.
+  function storedCoords(){
+    const lat = parseFloat(lsGet(LAT_KEY));
+    const lon = parseFloat(lsGet(LON_KEY));
+    if (!isFinite(lat) || !isFinite(lon)) return null;
+    if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+    return { lat: lat, lon: lon };
+  }
+
+  function storedElev(){
+    const e = parseFloat(lsGet(ELEV_KEY));
+    return isFinite(e) ? e : 0;
+  }
+  function elevIsManual(){ return lsGet(ELEV_MANUAL_KEY) === '1'; }
+
+  // Push the current location out to the rest of the page: map pin,
+  // sunrise/sunset, clock timezone and the sea-level pressure correction all
+  // key off this. Called on every change, including elevation-only edits.
+  function publish(tz, name){
+    const c = storedCoords();
+    if (!c || !window.setStationLocation) return;
+    window.setStationLocation({
+      lat: c.lat, lon: c.lon, elevM: storedElev(),
+      tz: tz || null, name: name || null
+    });
+  }
+
+  function showElev(v, manual){
+    elevInput.value = (v === null || v === undefined || !isFinite(v)) ? '' : String(Math.round(v));
+    elevInput.classList.toggle('auto', !manual);
+  }
+
   function refresh(){
-    const zip = (lsGet(ZIP_KEY) || '').trim();
-    if (!/^\d{5}$/.test(zip)) {
-      zipPlace.textContent = 'enter a ZIP';
+    const c = storedCoords();
+    if (!c) {
+      locPlace.textContent = 'enter coordinates';
       fcRows.innerHTML = '';
       note('');
       return;
@@ -982,13 +1103,28 @@ applyTheme(loadSavedTheme());
     if (busy) return;
     busy = true;
     note('');
-    resolveLocation(zip).then(function(loc){
-      zipPlace.textContent = loc.name;
-      // Hand the location to the rest of the page: the map pin, sunrise/sunset,
-      // the clock's timezone and the sea-level pressure correction all key off
-      // this one call.
-      if (window.setStationLocation) window.setStationLocation(loc);
-      return loadForecast(zip, loc.key);
+
+    // Elevation first and independently of AccuWeather: it's the thing the
+    // pressure reading depends on, it's keyless, and it must still work if
+    // the forecast is unavailable (bad key, quota, CORS, no internet).
+    const elevStep = elevIsManual()
+      ? Promise.resolve(storedElev())
+      : lookupElevation(c.lat, c.lon).then(function(v){
+          lsSet(ELEV_KEY, String(v));
+          showElev(v, false);
+          return v;
+        }).catch(function(){
+          note('elevation lookup failed -- type it in metres');
+          return storedElev();
+        });
+
+    elevStep.then(function(){
+      publish(null, null);              // pressure + pin correct even if the rest fails
+      return resolveLocation(c.lat, c.lon);
+    }).then(function(loc){
+      locPlace.textContent = loc.name || (c.lat.toFixed(3) + ', ' + c.lon.toFixed(3));
+      publish(loc.tz, loc.name);        // re-publish with the timezone
+      return loadForecast(coordKey(c.lat, c.lon), loc.key);
     }).then(function(days){
       renderForecast(days);
     }).catch(function(err){
@@ -998,34 +1134,83 @@ applyTheme(loadSavedTheme());
         // fetch() rejects with TypeError when the browser blocks the response.
         // For a cross-origin API that means CORS, which is worth naming: it
         // cannot be fixed from this page.
-        note('request blocked (CORS or offline)');
+        note('forecast request blocked (CORS or offline)');
       } else {
         note('forecast unavailable (' + err.message + ')');
       }
-      zipPlace.textContent = zip;
+      // The readings stay correct regardless -- publish() already ran.
+      locPlace.textContent = c.lat.toFixed(3) + ', ' + c.lon.toFixed(3);
     }).then(function(){ busy = false; });
   }
 
   // --- wiring ---
-  zipInput.value = lsGet(ZIP_KEY) || '';
+  (function initFields(){
+    const c = storedCoords();
+    if (c) { latInput.value = c.lat; lonInput.value = c.lon; }
+    const e = parseFloat(lsGet(ELEV_KEY));
+    if (isFinite(e)) showElev(e, elevIsManual());
+  })();
 
-  function commitZip(){
-    const v = zipInput.value.trim();
-    if (!/^\d{5}$/.test(v)) { note('ZIP must be 5 digits'); return; }
-    if (v === (lsGet(ZIP_KEY) || '')) return;
-    lsSet(ZIP_KEY, v);
+  function commitCoords(){
+    const lat = parseFloat(latInput.value.trim());
+    const lon = parseFloat(lonInput.value.trim());
+    if (!isFinite(lat) || !isFinite(lon)) { note('latitude and longitude must be numbers'); return; }
+    if (lat < -90 || lat > 90)   { note('latitude must be between -90 and 90'); return; }
+    if (lon < -180 || lon > 180) { note('longitude must be between -180 and 180'); return; }
+    const prev = storedCoords();
+    if (prev && prev.lat === lat && prev.lon === lon) return; // no-op, saves a call
+    lsSet(LAT_KEY, String(lat));
+    lsSet(LON_KEY, String(lon));
+    // New point invalidates a manual elevation -- it was for somewhere else.
+    lsSet(ELEV_MANUAL_KEY, '0');
+    showElev(null, false);
     fcRows.innerHTML = '';
     refresh();
   }
-  zipInput.addEventListener('change', commitZip);
-  zipInput.addEventListener('keydown', function(e){ if (e.key === 'Enter') commitZip(); });
+
+  function commitElev(){
+    const raw = elevInput.value.trim();
+    if (raw === '') {                     // blank -> revert to the automatic value
+      lsSet(ELEV_MANUAL_KEY, '0');
+      refresh();
+      return;
+    }
+    const v = parseFloat(raw);
+    if (!isFinite(v))            { note('elevation must be a number, in metres'); return; }
+    if (v < -500 || v > 9000)    { note('elevation must be between -500 and 9000 m'); return; }
+    lsSet(ELEV_KEY, String(v));
+    lsSet(ELEV_MANUAL_KEY, '1');
+    showElev(v, true);
+    note('');
+    publish(null, null);                  // re-render pressure immediately
+  }
+
+  [latInput, lonInput].forEach(function(el){
+    el.addEventListener('change', commitCoords);
+    el.addEventListener('keydown', function(e){ if (e.key === 'Enter') commitCoords(); });
+  });
+  elevInput.addEventListener('change', commitElev);
+  elevInput.addEventListener('keydown', function(e){ if (e.key === 'Enter') commitElev(); });
+
+  locClear.addEventListener('click', function(){
+    [LAT_KEY, LON_KEY, ELEV_KEY, ELEV_MANUAL_KEY].forEach(function(k){
+      try { localStorage.removeItem(k); } catch(e){}
+    });
+    latInput.value = ''; lonInput.value = ''; showElev(null, false);
+    locPlace.textContent = 'enter coordinates';
+    fcRows.innerHTML = '';
+    note('');
+    // Deliberately leaves the awLoc:/awFc:/elev: caches alone: they're keyed
+    // by coordinate, so re-entering the same point costs zero API calls.
+    if (window.clearStationLocation) window.clearStationLocation();
+  });
 
   // Re-label the day columns if the user switches timezone (no API call).
   const tzSel = document.getElementById('tzSelect');
   if (tzSel) tzSel.addEventListener('change', function(){
-    const zip = (lsGet(ZIP_KEY) || '').trim();
-    const c = /^\d{5}$/.test(zip) ? readJson(fcKeyFor(zip)) : null;
-    if (c && c.days) renderForecast(c.days);
+    const c = storedCoords();
+    const cache = c ? readJson(fcKeyFor(coordKey(c.lat, c.lon))) : null;
+    if (cache && cache.days) renderForecast(cache.days);
   });
 
   refresh();
