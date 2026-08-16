@@ -100,6 +100,30 @@ body{color:var(--theme-main);font-family:Arial,Helvetica,sans-serif;text-align:c
 .tz-select:focus{outline:1px solid var(--theme-main);}
 .status{font-size:11px;color:#c55;min-height:14px;}
 .status.synced{color:#5c5;display:none;} /* hide the noise once synced */
+
+/* --- station location: lat/lon/elevation, collapsed by default --- */
+/* Kept behind a <details> so the page still opens as three readings, an
+   indoor block and a clock. It is setup, not a reading, and it should not
+   compete with the numbers you actually came to look at. */
+.loc{width:100%;max-width:340px;border:1px solid var(--theme-dim);border-radius:8px;
+ background:rgba(0,0,0,0.25);padding:8px 12px;text-align:left;}
+.loc summary{font-size:12px;color:var(--theme-dim);letter-spacing:0.08em;cursor:pointer;
+ list-style:none;display:flex;justify-content:space-between;align-items:center;gap:8px;}
+.loc summary::-webkit-details-marker{display:none;}
+.loc summary .locsum{font-size:0.92em;opacity:0.85;white-space:nowrap;overflow:hidden;
+ text-overflow:ellipsis;max-width:15em;}
+.loc-fields{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:9px;}
+.loc-fields input{width:5.4em;background:transparent;color:var(--theme-main);
+ border:1px solid var(--theme-dim);border-radius:4px;font-family:inherit;font-size:14px;
+ padding:3px 6px;}
+.loc-fields input:focus{outline:1px solid var(--theme-main);}
+/* Dimmed while the elevation came from the lookup rather than from you. */
+.loc-fields input.auto{color:var(--theme-dim);}
+.loc-fields .flbl{font-size:11px;color:var(--theme-dim);letter-spacing:0.06em;}
+.loc-fields button{background:transparent;color:var(--theme-dim);border:1px solid var(--theme-dim);
+ border-radius:4px;font-family:inherit;font-size:13px;padding:3px 9px;cursor:pointer;}
+.loc-fields button:hover{color:var(--theme-main);border-color:var(--theme-main);}
+.loc-note{font-size:10px;color:#999;margin-top:7px;line-height:1.45;}
 </style>
 </head><body>
 
@@ -126,6 +150,18 @@ body{color:var(--theme-main);font-family:Arial,Helvetica,sans-serif;text-align:c
     <span id='clockLocal'>--:--</span><span class='grid-sep'></span><span id='localDate' class='tz-label'>--/--/----</span>
   </div>
 </div>
+
+<details class='loc'>
+  <summary>LOCATION<span class='locsum' id='locSummary'>not set</span></summary>
+  <div class='loc-fields'>
+    <input id='latInput' type='text' inputmode='decimal' placeholder='lat' aria-label='Latitude'/>
+    <input id='lonInput' type='text' inputmode='decimal' placeholder='lon' aria-label='Longitude'/>
+    <input id='elevInput' type='text' inputmode='decimal' placeholder='elev' aria-label='Elevation in metres'/>
+    <span class='flbl'>m</span>
+    <button id='locClear' title='Clear location'>clear</button>
+  </div>
+  <div class='loc-note' id='locNote'></div>
+</details>
 
 <div id='timeStatus' class='status'>connecting...</div>
 
@@ -193,23 +229,32 @@ function render(id, val, decimals=1){
 function hPaToInHg(hpa){ return hpa * 0.0295299830714; }
 
 // ============================================================
-// STATION -- set these three numbers once for your site.
+// STATION -- the live station location.
 // ============================================================
-// The full build resolves these from a ZIP code the user types. The lite
-// page has no such box by design, so they are constants here.
+// Set from the LOCATION box on the page and persisted in localStorage; the
+// values below are only the fallback for a browser that has never had one
+// entered. If you flash this for a fixed site and don't want anyone touching
+// the box, put your real numbers here and they become the defaults.
 //
 //   lat / lon : decimal degrees, south and west negative. Drives sunrise
-//               and sunset. Get them from any map -- three decimal places
-//               (~100 m) is far more precision than sunrise times need.
-//   elevM     : station elevation in METRES above sea level. Drives the
-//               sea-level pressure correction below. Leave it at 0 and the
-//               page simply reports raw station pressure, which is honest
-//               but won't match what your local airport reports.
+//               and sunset. Three decimal places (~100 m) is far more
+//               precision than sunrise times need.
+//   elevM     : station elevation in METRES. Drives the sea-level pressure
+//               correction below. At 0 the page reports raw station
+//               pressure -- honest, but it won't match your local airport.
 //
-// Getting elevM wrong skews pressure noticeably: at 1600 m an error of 50 m
-// moves the result by roughly 6 hPa, so it's worth looking up properly
-// rather than guessing.
+// Elevation is auto-looked-up from the entered coordinates where there's
+// internet, and stays hand-editable because that lookup is a ~90 m terrain
+// model: it gives ground height at the point, not your mast or your floor
+// of the building. Getting it wrong matters -- at 1600 m, a 50 m error moves
+// the reported pressure by roughly 6 hPa.
 const STATION = { lat: 47.606, lon: -122.332, elevM: 0 };
+
+// Frozen copy of the compiled-in values. STATION itself gets overwritten from
+// localStorage at load, so Clear needs somewhere to restore from. Clear goes
+// back to these rather than to nothing: the sunrise solver and toSeaLevel()
+// both read STATION unconditionally, so it must always be a valid point.
+const STATION_DEFAULT = Object.freeze({ lat: STATION.lat, lon: STATION.lon, elevM: STATION.elevM });
 
 // Sea-level pressure reduction, ICAO standard barometric formula:
 //   SLP = P_station * (1 + (0.0065 * alt_m) / T_K) ^ 5.2561
@@ -399,6 +444,171 @@ setInterval(tickClock, 5000);
 // once at load rather than waiting for a WebSocket push. They are also
 // recomputed on a timezone change, and the 5s tick rolls the date over.
 updateSunriseSunset();
+</script>
+<script>
+// ---- Station location entry ----
+//
+// Writes into the STATION object above, and persists to localStorage so it
+// survives reloads. Everything downstream -- sunrise/sunset and the
+// sea-level pressure correction -- already reads STATION, so this only has
+// to keep that object correct and re-render.
+//
+// OFFLINE IS THE CONSTRAINT HERE, not quota. This page has to work fully on
+// a phone joined to the station's own AP with no internet, which is the
+// entire reason the lite build exists. So the elevation lookup is a
+// PROGRESSIVE ENHANCEMENT: nothing on the page waits for it, the page has
+// already rendered before it is attempted, and if it fails the note simply
+// tells you to type the number in. The page itself still pulls zero external
+// resources at load time -- this is the only outbound request, it happens
+// only when you enter coordinates, and it is optional.
+(function(){
+  const LAT_KEY  = 'stationLat';
+  const LON_KEY  = 'stationLon';
+  const ELEV_KEY = 'stationElevM';
+  const ELEV_MANUAL_KEY = 'stationElevManual'; // '1' = you typed it; don't overwrite
+  const OPEN_METEO_ELEV = 'https://api.open-meteo.com/v1/elevation';
+
+  const latInput  = document.getElementById('latInput');
+  const lonInput  = document.getElementById('lonInput');
+  const elevInput = document.getElementById('elevInput');
+  const locClear  = document.getElementById('locClear');
+  const locNote   = document.getElementById('locNote');
+  const locSummary= document.getElementById('locSummary');
+
+  function lsGet(k){ try { return localStorage.getItem(k); } catch(e){ return null; } }
+  function lsSet(k,v){ try { localStorage.setItem(k,v); } catch(e){} }
+  function lsDel(k){ try { localStorage.removeItem(k); } catch(e){} }
+  function note(m){ locNote.textContent = m || ''; }
+
+  // Elevation cache is keyed on the rounded coordinate -- terrain doesn't
+  // move, so this is never re-fetched for a point you've already used.
+  function coordKey(lat, lon){ return lat.toFixed(3) + ',' + lon.toFixed(3); }
+
+  function manual(){ return lsGet(ELEV_MANUAL_KEY) === '1'; }
+
+  function showElev(v, isManual){
+    elevInput.value = (v === null || v === undefined || !isFinite(v)) ? '' : String(Math.round(v));
+    elevInput.classList.toggle('auto', !isManual);
+  }
+
+  function summarise(){
+    locSummary.textContent =
+      STATION.lat.toFixed(3) + ', ' + STATION.lon.toFixed(3) + '  ·  ' + Math.round(STATION.elevM) + ' m';
+  }
+
+  // Apply STATION to everything that depends on it. renderReadings redoes the
+  // pressure correction; updateSunriseSunset redoes the solar times.
+  function apply(){
+    summarise();
+    updateSunriseSunset();
+    if (typeof _lastWs !== 'undefined' && _lastWs) renderReadings(_lastWs);
+  }
+
+  function lookupElevation(lat, lon){
+    const ck = coordKey(lat, lon);
+    const cached = lsGet('elev:' + ck);
+    if (cached !== null && cached !== '') return Promise.resolve(parseFloat(cached));
+    return fetch(OPEN_METEO_ELEV + '?latitude=' + encodeURIComponent(lat)
+                 + '&longitude=' + encodeURIComponent(lon))
+      .then(function(r){ if (!r.ok) throw new Error('http-' + r.status); return r.json(); })
+      .then(function(j){
+        const v = (j && j.elevation && j.elevation.length) ? j.elevation[0] : null;
+        if (typeof v !== 'number') throw new Error('bad-response');
+        lsSet('elev:' + ck, String(v));
+        return v;
+      });
+  }
+
+  function commitCoords(){
+    const lat = parseFloat(latInput.value.trim());
+    const lon = parseFloat(lonInput.value.trim());
+    if (!isFinite(lat) || !isFinite(lon)) { note('latitude and longitude must be numbers'); return; }
+    if (lat < -90 || lat > 90)   { note('latitude must be between -90 and 90'); return; }
+    if (lon < -180 || lon > 180) { note('longitude must be between -180 and 180'); return; }
+    if (STATION.lat === lat && STATION.lon === lon && lsGet(LAT_KEY) !== null) return;
+
+    STATION.lat = lat; STATION.lon = lon;
+    lsSet(LAT_KEY, String(lat)); lsSet(LON_KEY, String(lon));
+    // A new point invalidates a hand-typed elevation -- it was for elsewhere.
+    lsSet(ELEV_MANUAL_KEY, '0');
+    note('');
+    apply();   // sunrise/sunset are correct immediately, without the network
+
+    lookupElevation(lat, lon).then(function(v){
+      if (manual()) return;              // user typed one while we were waiting
+      STATION.elevM = v;
+      lsSet(ELEV_KEY, String(v));
+      showElev(v, false);
+      note('elevation from terrain model — edit if it\'s wrong for your site');
+      apply();
+    }).catch(function(){
+      note('no elevation lookup (offline?) — type it in metres');
+    });
+  }
+
+  function commitElev(){
+    const raw = elevInput.value.trim();
+    if (raw === '') {                    // blank -> go back to automatic
+      lsSet(ELEV_MANUAL_KEY, '0');
+      lsDel('elev:' + coordKey(STATION.lat, STATION.lon));
+      commitCoordsRefetch();
+      return;
+    }
+    const v = parseFloat(raw);
+    if (!isFinite(v))         { note('elevation must be a number, in metres'); return; }
+    if (v < -500 || v > 9000) { note('elevation must be between -500 and 9000 m'); return; }
+    STATION.elevM = v;
+    lsSet(ELEV_KEY, String(v));
+    lsSet(ELEV_MANUAL_KEY, '1');
+    showElev(v, true);
+    note('');
+    apply();
+  }
+
+  function commitCoordsRefetch(){
+    lookupElevation(STATION.lat, STATION.lon).then(function(v){
+      STATION.elevM = v; lsSet(ELEV_KEY, String(v)); showElev(v, false); note(''); apply();
+    }).catch(function(){
+      note('no elevation lookup (offline?) — type it in metres');
+    });
+  }
+
+  // --- restore ---
+  (function restore(){
+    const lat = parseFloat(lsGet(LAT_KEY)), lon = parseFloat(lsGet(LON_KEY));
+    if (isFinite(lat) && isFinite(lon) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
+      STATION.lat = lat; STATION.lon = lon;
+    }
+    const e = parseFloat(lsGet(ELEV_KEY));
+    if (isFinite(e) && e >= -500 && e <= 9000) STATION.elevM = e;
+    latInput.value = STATION.lat;
+    lonInput.value = STATION.lon;
+    showElev(STATION.elevM, manual());
+    apply();
+  })();
+
+  [latInput, lonInput].forEach(function(el){
+    el.addEventListener('change', commitCoords);
+    el.addEventListener('keydown', function(e){ if (e.key === 'Enter') commitCoords(); });
+  });
+  elevInput.addEventListener('change', commitElev);
+  elevInput.addEventListener('keydown', function(e){ if (e.key === 'Enter') commitElev(); });
+
+  locClear.addEventListener('click', function(){
+    [LAT_KEY, LON_KEY, ELEV_KEY, ELEV_MANUAL_KEY].forEach(lsDel);
+    // Back to the compiled-in defaults rather than to nothing: STATION has to
+    // stay a valid point, since the sunrise solver and toSeaLevel() both read
+    // it unconditionally.
+    STATION.lat = STATION_DEFAULT.lat;
+    STATION.lon = STATION_DEFAULT.lon;
+    STATION.elevM = STATION_DEFAULT.elevM;
+    latInput.value = STATION.lat;
+    lonInput.value = STATION.lon;
+    showElev(STATION.elevM, false);
+    note('reset to built-in default');
+    apply();
+  });
+})();
 </script>
 
 </body></html>

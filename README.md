@@ -6,7 +6,7 @@ Both nodes run on the [Seeed XIAO ESP32-C6](https://wiki.seeedstudio.com/xiao_es
 
 > **This is the `lite-ui` branch.** Same firmware as [`main`](https://github.com/Snokones/Hamsense/tree/main), but with a condensed, mobile-first page: no world map, no colour-theme picker, no 7-day panel, no ZIP box and no forecast. It pulls **zero external resources**, so it loads completely on a phone joined only to the station's own `PotaSense` AP with no internet — which is the whole point of it.
 >
-> Because there's no ZIP box, the station's latitude, longitude and elevation are three constants at the top of the script in `web_pages.h`. **Set `STATION` once for your site** — it drives sunrise/sunset and the sea-level pressure correction.
+> The station's latitude, longitude and elevation are set from a collapsed **LOCATION** box on the page and persisted per browser. Elevation auto-fills from the entered coordinates where there's internet, and stays editable. With no internet the lookup is skipped and you type the elevation in — everything else still works. The `STATION` constant in `web_pages.h` is the built-in default for a browser that's never had one entered.
 >
 > **No GPS.** The ATGM336H and TinyGPS++ are gone. The older GPS build is preserved on the [`gps`](https://github.com/Snokones/Hamsense/tree/gps) branch.
 >
